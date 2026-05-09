@@ -108,8 +108,8 @@ def release_locks(conn: sqlite3.Connection, agent_id: str) -> None:
 
 
 def block(reason: str) -> None:
-    print(json.dumps({"decision": "block", "reason": reason}))
-    sys.exit(1)
+    print(reason, file=sys.stderr)
+    sys.exit(2)
 
 
 def allow() -> None:
