@@ -4,7 +4,7 @@
 
 ---
 
->![NOTE] This repository uses Claude as a comparison and a baseline agentic harness, however the only Claude-specific thing is the schema of the hooks. The concept of hooks exists for all agentic harnesses making this framework harness agnostic with minor revisions.
+>[!NOTE] This repository uses Claude as a comparison and a baseline agentic harness, however the only Claude-specific thing is the schema of the hooks. The concept of hooks exists for all agentic harnesses making this framework harness agnostic with minor revisions.
 
 ## Origin
 
@@ -85,15 +85,14 @@ The coordinator uses `agent_id` as the lock owner identity, falling back to `ses
 
 ### Lock table
 
-SQLite with WAL mode. The lock table uses a composite primary key of `(file_path, agent_id)` — a deliberate design: the same agent can re-enter its own lock (idempotent), but a different agent hitting the same file_path gets an `IntegrityError` on insert, which is the conflict signal.
+SQLite with WAL mode. The lock table uses `file_path` as the sole primary key — a different agent hitting the same `file_path` gets an `IntegrityError` on insert, which is the conflict signal. The same agent re-entering its own lock is handled by checking the existing `agent_id` before inserting.
 
 ```sql
 CREATE TABLE IF NOT EXISTS locks (
-    file_path   TEXT NOT NULL,
+    file_path   TEXT PRIMARY KEY,
     agent_id    TEXT NOT NULL,
     agent_type  TEXT,
-    acquired_at TEXT DEFAULT (datetime('now')),
-    PRIMARY KEY (file_path, agent_id)
+    acquired_at TEXT DEFAULT (datetime('now'))
 );
 ```
 
@@ -103,9 +102,33 @@ File paths are normalized to absolute paths before lookup so worktree variants c
 
 The coordinator fails closed. If the DB is unavailable, or the hook script errors, the tool call is blocked with a coordinator error message. Failing open would silently degrade to zero coordination — agents would bulldoze each other and there would be no visible signal that anything was wrong. Visible failure is always preferable to silent degradation.
 
+### Lock lifetime — the hopping model
+
+The coordinator does not tie lock lifetime to agent lifetime. An agent editing three unrelated files — `parser.py`, `renderer.py`, `config.py` — with no shared dependency edges between them is executing three independent editing sessions. Holding a lock on `parser.py` while working on `renderer.py` is unnecessary and blocks other agents from files they could legitimately touch.
+
+The lock window is precisely:
+
+- **Acquired**: PreToolUse fires, coordinator inserts the lock row
+- **Required**: the edit is in flight and the global cache has not yet been updated with the result
+- **Released**: PostToolUse completes, global cache updated with new subgraph hash, lock row deleted
+
+After PostToolUse for `parser.py`, the lock is released. The agent hops to `renderer.py`, acquires a new lock, edits, releases. Lock lifetime equals subgraph-editing-session, not agent lifetime.
+
+The exception: if an agent's edits span a shared dependency subgraph, locks on all nodes in that subgraph must be held for the duration of all edits within it. Releasing mid-way would allow another agent to mutate a shared dependency while the first agent's work is still in progress.
+
+### The editing session boundary problem
+
+Claude Code does not expose a clean "editing session start" hook. There is no event that fires when Claude begins reasoning about what it intends to edit — only when it submits the tool call. This is not a gap in the hook design; it reflects a fundamental property of LLMs: intent cannot be determined from reasoning alone, only from what is ultimately acted on.
+
+The implication: the coordinator cannot pre-claim a subgraph before Claude reasons about it. Lock acquisition happens at PreToolUse, the earliest point where the target is known with certainty. Everything before that is probabilistic pre-warming. Everything after that is deterministic enforcement.
+
+This creates an efficiency exposure: if Claude reasons for a long time before issuing an Edit call, another agent may apply changes to a dependency in the meantime. The PreToolUse hash check catches this — the subgraph has drifted, the edit is blocked, Claude replans with the current picture. The reasoning work is lost. This is a token efficiency problem, not a correctness problem; correctness is always maintained by the hash check. The frequency of this case is trackable heuristically via the timestamp gap between the last `FileChanged` on a dependency and the blocked `PreToolUse` — high rates indicate either long reasoning turns or high contention on a subgraph, and are worth logging as a diagnostic signal.
+
+> LLMs are indeterministic actors and the system shall treat them as such.
+
 ### Lock release
 
-The `--release` flag on PostToolUse triggers `DELETE FROM locks WHERE agent_id = ?`, releasing all locks held by the completing agent. Release failures are non-critical and swallowed silently — worst case a stale lock lingers until TTL expiry (v2).
+The `--release` flag triggers `DELETE FROM locks WHERE file_path = ?`, releasing the lock for the completed editing session. Release failures are non-critical and swallowed silently — worst case a stale lock lingers until TTL expiry (v2).
 
 ---
 
@@ -153,8 +176,7 @@ When an agent's PreToolUse fires, the coordinator crawls 2-3 edges deep from the
 
 Exploratory tool use hooks are distinct from RW tool use hooks, this allows for different crawling depths based on the anticipated action.
 
-An existing conceptual limitation is deeply nested dynamic imports ex. `importlib.import_module()` where the target is a variable. Static AST craw
-cannot resolve these cases.
+An existing conceptual limitation is deeply nested dynamic imports ex. `importlib.import_module()` where the target is a variable. Static AST crawl cannot resolve these cases.
 
 ### Worktree state vs. global cache
 
@@ -162,23 +184,29 @@ Qualitatively: the worktree is "what is going on in my world." The global cache 
 
 Each agent operates in its own git worktree, giving it an isolated filesystem view. The coordinator maintains a global SQLite cache as the single source of truth for subgraph hashes across all agents. These two layers serve distinct purposes and must not be conflated.
 
-**Passive crawl triggers**
+**Passive crawl triggers and full hook inventory**
 
-Beyond write-time crawling, Claude Code exposes hooks that allow the coordinator to update the global cache *before* any tool use fires:
+Beyond write-time crawling, Claude Code exposes hooks that allow the coordinator to update the global cache before any tool use fires. The full set of hook events and their coordinator relevance:
 
-- `FileChanged` — a file was mutated in a worktree. Unambiguously attributable to the owning agent (one worktree, one agent). Triggers a subgraph crawl from that file, cache updated immediately.
-- `CwdChanged` — agent navigated to a new directory. Crawl 2-3 edges from the new working context, warm the cache preemptively.
-- `SubagentStart` — new agent spawned. Register in coordinator, note worktree assignment, begin tracking.
+| Hook | Coordinator use |
+|------|----------------|
+| `SessionStart` | Initialize coordinator DB for the session |
+| `SubagentStart` | Register agent, record worktree assignment, begin tracking |
+| `SubagentStop` | Deregister agent, release any remaining locks held by that agent |
+| `WorktreeCreate` | Record worktree↔agent mapping, used for path normalization |
+| `WorktreeRemove` | Clean up worktree mapping, trigger final lock release for that worktree |
+| `FileChanged` | File mutated in a worktree — crawl subgraph from that file, update global cache |
+| `CwdChanged` | Agent navigated to new directory — crawl 2-3 edges from new context, warm cache |
+| `PostToolBatch` | After a parallel batch of tool calls resolves — validate batch as a unit before next model call, useful if an agent fires multiple edits in parallel |
+| `PreToolUse` | **Primary enforcement point** — lock acquisition and drift check before any write |
+| `PostToolUse` | **Primary release point** — cache update and lock release after write completes |
+| `PostToolUseFailure` | Edit failed — release lock without updating cache, leave previous hash intact |
+| `PreCompact` | Snapshot coordinator state before context compaction in case of post-compact replanning |
+| `SessionEnd` | Final cleanup, release all remaining locks, persist cache to disk |
 
-These passive triggers mean that by the time `PreToolUse` fires on a write, the cache is likely already warm from the agent's own reconnaissance. Red herring cache checks — nodes that haven't changed since last crawl — resolve as cheap hash comparisons with no further work. The crawl cost is paid once; subsequent hits are essentially free.
+Hooks not listed (`UserPromptSubmit`, `Notification`, `Stop`, etc.) have no coordinator relevance.
 
-**The reasoning turn gap**
-
-Claude's reasoning turn produces no hooks. There is no "reasoning start" event, and even if there were, the coordinator cannot with certainty know what Claude is reasoning *about* — only what it ultimately decides to act on. The best the coordinator can do is infer that Claude is probably reasoning about files it has recently looked at, and use `FileChanged` and `CwdChanged` to keep those subgraphs warm.
-> LLMs are indeterministic actors and the system shall treat them as such.
-
-
-`PreToolUse` on a write is where certainty is established. That hook confirms exactly what Claude intends to edit, with the file path and diff content in the payload. Everything before that is probabilistic pre-warming. Everything after that is deterministic enforcement.
+`FileChanged` and `CwdChanged` are the primary passive warming triggers. By the time `PreToolUse` fires on a write, the cache is likely already warm from the agent's own reconnaissance. Cache checks on nodes that haven't changed since last crawl resolve as cheap hash comparisons with no further work. The crawl cost is paid once per node per session; subsequent hits are essentially free.
 
 **Race conditions**
 
