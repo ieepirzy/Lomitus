@@ -156,6 +156,53 @@ Exploratory tool use hooks are distinct from RW tool use hooks, this allows for 
 An existing conceptual limitation is deeply nested dynamic imports ex. `importlib.import_module()` where the target is a variable. Static AST craw
 cannot resolve these cases.
 
+### Worktree state vs. global cache
+
+Qualitatively: the worktree is "what is going on in my world." The global cache is "what is actually real."
+
+Each agent operates in its own git worktree, giving it an isolated filesystem view. The coordinator maintains a global SQLite cache as the single source of truth for subgraph hashes across all agents. These two layers serve distinct purposes and must not be conflated.
+
+**Passive crawl triggers**
+
+Beyond write-time crawling, Claude Code exposes hooks that allow the coordinator to update the global cache *before* any tool use fires:
+
+- `FileChanged` — a file was mutated in a worktree. Unambiguously attributable to the owning agent (one worktree, one agent). Triggers a subgraph crawl from that file, cache updated immediately.
+- `CwdChanged` — agent navigated to a new directory. Crawl 2-3 edges from the new working context, warm the cache preemptively.
+- `SubagentStart` — new agent spawned. Register in coordinator, note worktree assignment, begin tracking.
+
+These passive triggers mean that by the time `PreToolUse` fires on a write, the cache is likely already warm from the agent's own reconnaissance. Red herring cache checks — nodes that haven't changed since last crawl — resolve as cheap hash comparisons with no further work. The crawl cost is paid once; subsequent hits are essentially free.
+
+**The reasoning turn gap**
+
+Claude's reasoning turn produces no hooks. There is no "reasoning start" event, and even if there were, the coordinator cannot with certainty know what Claude is reasoning *about* — only what it ultimately decides to act on. The best the coordinator can do is infer that Claude is probably reasoning about files it has recently looked at, and use `FileChanged` and `CwdChanged` to keep those subgraphs warm.
+> LLMs are indeterministic actors and the system shall treat them as such.
+
+
+`PreToolUse` on a write is where certainty is established. That hook confirms exactly what Claude intends to edit, with the file path and diff content in the payload. Everything before that is probabilistic pre-warming. Everything after that is deterministic enforcement.
+
+**Race conditions**
+
+The passive crawl architecture introduces a race condition: agent A's `PostToolUse` or `FileChanged` updates the global cache while agent B is mid-reasoning about a node in the same subgraph. Agent B's reasoning was formed against a now-stale picture. The coordinator cannot detect this during B's reasoning turn.
+
+This is acceptable for two reasons:
+
+1. Locks prevent the worst case. If agent A holds a lock on any node, agent B cannot acquire a lock and apply an edit on any node that shares a dependency with it. The lock graph structurally prevents the most damaging collisions — two agents cannot simultaneously commit writes to a shared subgraph. However should the agents write quickly in sequence, any conflicting changes are blocked for the agent that writes last.
+
+2. `PreToolUse` is the safety net. Even if agent B reasoned against stale state, the write-time hash comparison catches any drift before the edit is applied. Agent B gets blocked and replans with the current picture.
+
+The race condition means the coordinator cannot guarantee that agent B's *reasoning* was accurate. It can guarantee that agent B's *writes* don't corrupt a subgraph that shifted under it. That is the correct promise for a deterministic coordination layer.
+
+**Benign dependency collisions**
+
+Not all dependency collisions warrant blocking. Import statements and module-level variable declarations are shared dependencies — every method in a file implicitly depends on them — but edits to them are typically additive and low-risk. Two agents both importing a new module from the same file do not conflict in any meaningful sense.
+
+The coordinator should classify dependency nodes by type:
+
+- **Structural nodes** (method definitions, class definitions): full lock enforcement, no concurrent writes.
+- **Benign nodes** (import statements, module-level variable declarations): collision allowed, concurrent writes permitted, hash still tracked for drift detection.
+
+This avoids false blocks on trivially non-conflicting edits while maintaining full protection on the nodes where semantic conflicts actually occur. The classification is statically determinable from the AST node type — no LLM needed.
+
 ### Cold cache rule
 
 PreToolUse on any write, if the node is not in cache: crawl now, store as baseline, then proceed with lock acquisition. No exceptions.
