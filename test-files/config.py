@@ -1,0 +1,5 @@
+DEBUG = False
+MAX_RETRIES = 5
+TIMEOUT = 30
+BASE_URL = "http://localhost:8000"
+LOG_LEVEL = "INFO"

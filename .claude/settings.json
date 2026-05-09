@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --release"
+          }
+        ]
+      }
+    ]
+  }
+}
