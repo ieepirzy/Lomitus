@@ -118,11 +118,22 @@ def allow() -> None:
 
 
 def main() -> None:
+
+    if "--release" in sys.argv:
+        try:
+            payload = parse_hook_input()
+            _, agent_id, _, _ = extract_context(payload)
+            conn = get_db()
+            release_locks(conn, agent_id)
+        except Exception:
+            pass  # release failures are non-critical
+        sys.exit(0)
+
     try:
         payload = parse_hook_input()
     except (json.JSONDecodeError, Exception) as e:
-        # Never block on coordinator failure — fail open
-        sys.exit(0)
+        # Block on coordinator failure, prevents silent collisions that surface in merge conflicts
+        block("Coordinator error: cannot guarantee safe access.")
 
     file_path, agent_id, agent_type, session_id = extract_context(payload)
 
@@ -132,8 +143,8 @@ def main() -> None:
     try:
         conn = get_db()
     except Exception:
-        # DB unavailable — fail open
-        sys.exit(0)
+        # DB unavailable fail closed as above
+        block("Coordinator error: cannot guarantee safe access.")
 
     blocker = try_acquire(conn, file_path, agent_id, agent_type)
 
