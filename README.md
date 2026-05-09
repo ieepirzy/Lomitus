@@ -4,6 +4,8 @@
 
 ---
 
+>![NOTE] This repository uses Claude as a comparison and a baseline agentic harness, however the only Claude-specific thing is the schema of the hooks. The concept of hooks exists for all agentic harnesses making this framework harness agnostic with minor revisions.
+
 ## Origin
 
 The insight that started this came during a drive. Approaching a roundabout, the coordination problem became suddenly obvious: multiple cars, shared nodes, priority rules, no central dispatcher. Traffic works because every agent follows a local rule set that produces globally consistent behavior. The question that followed was: why don't coding agents do the same thing?
@@ -135,11 +137,36 @@ At write time (PostToolUse), the same hash is recomputed and compared against th
 
 This is environment drift detection: not "what did this agent change" but "did the world this agent was reasoning from shift under it."
 
+Note: this means that agents only claim relevant parts of the subgraph on the acting turn, which triggers the validation steps before being accepted
+
 ### Bloom filter
 
 In large codebases, a dependency subgraph can contain thousands of nodes. Checking each against SQLite individually before acquiring a subgraph lock is wasteful. A bloom filter sits in front of the DB as a pre-check: nodes that are definitely not locked are skipped, only candidates hit SQLite. False positives just mean an unnecessary DB lookup, which is acceptable. False negatives are impossible by construction.
 
 For v0 with single-file locking, the bloom filter adds nothing — one primary key lookup is already optimal. It earns its place at subgraph scale.
+
+### Lazy cache population
+
+There is no upfront crawl of the codebase. Upfront crawling doesn't scale — new codebases start from nothing with a rapidly growing dep graph, and large codebases take too long to crawl naively. Instead, the cache is populated lazily by write events.
+
+When an agent's PreToolUse fires, the coordinator crawls 2-3 edges deep from the target node, hashes the subgraph, and stores it in the cache. The cache stays current as a natural side effect of write hooks: if agent B touched a dependency, it went through PreToolUse, meaning the coordinator already crawled and cached that node. By the time agent A wants to edit something in that dependency chain, fresh hashes are already in the DB. No read hooks are needed — write events are sufficient.
+
+Exploratory tool use hooks are distinct from RW tool use hooks, this allows for different crawling depths based on the anticipated action.
+
+An existing conceptual limitation is deeply nested dynamic imports ex. `importlib.import_module()` where the target is a variable. Static AST craw
+cannot resolve these cases.
+
+### Cold cache rule
+
+PreToolUse on any write, if the node is not in cache: crawl now, store as baseline, then proceed with lock acquisition. No exceptions.
+
+A cold cache on a write means no baseline hash exists, so drift cannot be detected. The on-demand crawl *is* the baseline establishment. Cold cache is never "skip" — it's always "crawl first."
+
+The cost is acceptable: it happens once per node per session, and only for nodes that actually get touched. After the first crawl the node is warm and subsequent checks are hash comparisons only.
+
+### Dual-use AST cache
+
+The same parse and crawl serves both subgraph hash comparison (drift detection) and I/O contract validation. The expensive part — parsing — happens once per node per session. Two consumers, one cache. Allowed writes, that is, writes that pass the pre and post tool use hooks for the editing agent, which ensures consistency (see below), then overwrite the previous hash. 
 
 ---
 
@@ -206,8 +233,8 @@ The LLMs do the actual code work. The coordinator does assignment and collision 
 ## Complexity Estimate
 
 - v0: ~100 LOC Python. An afternoon.
-- v1: Large project tier for a pragmatic Python + TS implementation. The dep graph integration and subgraph hashing are the bulk of the work.
-- v2: Approaches PhD territory only if targeting formal correctness guarantees across arbitrary languages. For pragmatic Python + TS with open-world validation and heuristic TTL, it stays at Large project level.
+- v1: MSc or large project tier for a pragmatic Python + TS implementation. The dep graph integration and subgraph hashing are the bulk of the work.
+- v2: Approaches PhD territory only if targeting formal correctness guarantees across arbitrary languages. For pragmatic Python + TS with open-world validation and heuristic TTL, it stays at MSc or comparable level.
 
 The integration of runtime agent coordination, partial AST rollback, live dep graph, and I/O contract validation from real call sites is novel relative to the current ecosystem. No existing multi-agent coding framework implements this combination.
 
@@ -219,7 +246,7 @@ GPLv3. Commercial products may ship the coordinator as an unmodified subprocess.
 
 ---
 
-*Design developed, latest update May 2026. v0 confirmed working.*
+*Design developed May 2026. v0 confirmed working.*
 © Ilari Pirkkalainen [ieepirzy](https://github.com/ieepirzy) 2026
 
 **AUTHORIZED EYES ONLY DOCUMENT NOT MEANT FOR PUBLIC DISCLOSURE OR CIRCULATION UNTIL INTENTIONAL PUBLIC RELEASE**
