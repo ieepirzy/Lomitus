@@ -23,11 +23,10 @@ from pathlib import Path
 DB_PATH = Path(".claude/coordinator.db")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS locks (
-    file_path   TEXT NOT NULL,
+    file_path   TEXT PRIMARY KEY,
     agent_id    TEXT NOT NULL,
     agent_type  TEXT,
-    acquired_at TEXT DEFAULT (datetime('now')),
-    PRIMARY KEY (file_path, agent_id)
+    acquired_at TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS agents (
