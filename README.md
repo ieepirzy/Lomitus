@@ -220,6 +220,6 @@ GPLv3. Commercial products may ship the coordinator as an unmodified subprocess.
 ---
 
 *Design developed, latest update May 2026. v0 confirmed working.*
-© Ilari Pirkkalainen (ieepirzy) 2026- 
+© Ilari Pirkkalainen [ieepirzy](https://github.com/ieepirzy) 2026
 
-__AUTHORIZED EYES ONLY DOCUMENT NOT MEANT FOR PUBLIC DISCLOSURE OR CIRCULATION UNTIL OPEN SOURCE RELEASE__
+**AUTHORIZED EYES ONLY DOCUMENT NOT MEANT FOR PUBLIC DISCLOSURE OR CIRCULATION UNTIL INTENTIONAL PUBLIC RELEASE**
