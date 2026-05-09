@@ -16,7 +16,6 @@ Usage in .claude/settings.json:
 """
 
 import json
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -95,8 +94,8 @@ def try_acquire(conn: sqlite3.Connection, file_path: str, agent_id: str, agent_t
     except sqlite3.IntegrityError:
         # PRIMARY KEY conflict → file already locked by someone
         row = conn.execute(
-            "SELECT agent_id FROM locks WHERE file_path = ? AND agent_id != ?",
-            (file_path, agent_id),
+            "SELECT agent_id FROM locks WHERE file_path = ?",
+            (file_path,),
         ).fetchone()
         return row[0] if row else None
 
