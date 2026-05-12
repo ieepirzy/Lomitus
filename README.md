@@ -142,6 +142,24 @@ File locking prevents two agents from writing the same file simultaneously, but 
 
 The unit of locking needs to be the *subgraph*, not the file.
 
+### Lock table (v1)
+
+The lock table key changes from `file_path` (v0) to `node_id` — a `"abs_path::name"` identifier for the specific function or class being edited. This enables two agents editing different methods in the same file to proceed concurrently without conflict.
+
+```sql
+CREATE TABLE IF NOT EXISTS locks (
+    node_id        TEXT PRIMARY KEY,   -- "abs_path::function_name" or "abs_path::__file__"
+    file_path      TEXT NOT NULL,      -- denormalised for bloom filter and batch release
+    agent_id       TEXT NOT NULL,
+    agent_type     TEXT,
+    subgraph_hash  TEXT,               -- Merkle root at acquisition time
+    subgraph_nodes TEXT,               -- JSON list of node_ids in the 1-edge subgraph
+    acquired_at    TEXT DEFAULT (datetime('now'))
+);
+```
+
+The `abs_path::__file__` sentinel is used when the Write tool targets a file with no existing structural nodes (empty or brand-new file), giving the first writer an exclusive file-level lock until the file has content.
+
 ### Dependency graph
 
 Existing tooling handles most of the static graph construction:
@@ -156,15 +174,15 @@ Graph invalidation is asymmetric, which matters for performance:
 
 ### Subgraph hash
 
-At lock acquisition, the coordinator crawls the dependency subgraph rooted at the target node and hashes the relevant bits — method contents for v1, AST node signatures for later. This hash is stored alongside the lock.
+**At PreToolUse (lock acquisition):** the coordinator crawls the dependency subgraph rooted at the target node, fetches the current content hashes from the global cache, computes a Merkle root over the 1-edge subgraph, and stores it alongside the lock row. This snapshot represents the state of the world at the moment the agent committed to its edit.
 
-At write time (PreToolUse), the same hash is recomputed and compared against the stored value. If it has drifted — meaning something outside this agent mutated a dependency while the agent was working — the agent's edit was built on stale assumptions. The coordinator blocks and explains, and the agent replans. **The lock is acquired as the first step of PreToolUse**. 
+**At PostToolUse (lock release):** the same Merkle root is recomputed from the current global cache and compared against the stored value. If it has drifted — meaning something outside this agent mutated a dependency in the narrow window between snapshot and lock application — the agent's edit was built on stale assumptions. The coordinator blocks and explains, and the agent replans.
 
 This is environment drift detection: not "what did this agent change" but "did the world this agent was reasoning from shift under it."
 
-Note: this means that agents only claim relevant parts of the subgraph on the acting turn, which triggers the validation steps before being accepted
+Note: this means that agents only claim relevant parts of the subgraph on the acting turn, which triggers the validation steps before being accepted.
 
-Edits that add new meethods, or files, will trigger graph extentions and crawling PostToolUse.
+Edits that add new methods or files will trigger graph extensions and crawling PostToolUse.
 
 ### Bloom filter
 
@@ -178,9 +196,14 @@ For v0 with single-file locking, the bloom filter adds nothing — one primary k
 
 There is no upfront crawl of the codebase. Upfront crawling doesn't scale — new codebases start from nothing with a rapidly growing dep graph, and large codebases take too long to crawl naively. Instead, the cache is populated lazily by write events.
 
-When an agent's PreToolUse fires, the coordinator crawls 2-3 edges deep from the target node, hashes the subgraph, and stores it in the cache. The cache stays current as a natural side effect of write hooks: if agent B touched a dependency, it went through PreToolUse, meaning the coordinator already crawled and cached that node. By the time agent A wants to edit something in that dependency chain, fresh hashes are already in the DB. No read hooks are needed — write events are sufficient.
+Crawl depth is not uniform — it depends on the hook type:
 
-A global state is kept consistent even when agents are  working in different git worktrees by utilizing git's commands.
+- **PreToolUse (enforcement):** 1 edge deep. Tight scope, fast, captures direct dependencies only. This is the depth used for lock acquisition and drift detection.
+- **Passive warming hooks** (`FileChanged`, `CwdChanged`, non-editing tool use): 2-3 edges deep. Wide scope, populates the cache ahead of writes that haven't happened yet.
+
+When an agent's PreToolUse fires, the coordinator checks the 1-edge subgraph against the cache and stores the snapshot. The cache stays current as a natural side effect of write hooks: if agent B touched a dependency, it went through PreToolUse, meaning the coordinator already crawled and cached that node. By the time agent A wants to edit something in that dependency chain, fresh hashes are already in the DB. No read hooks are needed — write events are sufficient.
+
+A global state is kept consistent even when agents are working in different git worktrees by utilizing git commands. Each agent's worktree has its own filesystem view; the coordinator normalises all paths to canonical project-root-relative keys and uses git to read file state from the authoritative tree rather than from a specific worktree's working copy.
 
 Exploratory tool use hooks are distinct from RW tool use hooks, this allows for different crawling depths based on the anticipated action.
 
@@ -290,6 +313,47 @@ The validator uses subset semantics, not strict equality. Additive changes — n
 This is the open-world assumption applied to I/O contracts: the coordinator only cares that the minimum required pieces are present and correct. It ignores anything extra. This prevents the system from forcing technical debt workarounds when the right solution genuinely is to extend the output schema.
 
 Strictly: `required_keys ⊆ new_output_keys` and `types_match(required_keys)`.
+
+### Cascade Validation — Planned Contract Evolution
+
+Hard-blocking on I/O contract changes is the wrong default. A refactor that
+genuinely needs to change a return type or restructure output is legitimate work —
+blocking it forces the agent into bad workarounds or silent schema drift. The correct
+response to a detected contract change is not obstruction but surfacing: make the
+blast radius explicit, force the change to be deliberate, and let the agent proceed
+with full awareness of what it has committed to.
+
+When PostToolUse detects an I/O contract change on a target node — a subtractive or
+mutating delta that fails the superset check — the coordinator does not block. Instead
+it crawls upward from the changed node to identify all direct and transitive dependents
+whose I/O assumptions are now invalidated. The agent receives a cascade task list via
+stderr:
+
+    I/O contract change detected on mutate_data().
+    Dependents requiring update: validate_input(), format_output(), serialize_result().
+    Cascade lock acquired. Proceed with updates or revert to restore previous contract.
+
+The cascade task list is ordered by dependency graph topology — outermost dependents
+first, so each node is updated against an already-resolved contract rather than a
+mix of old and new. The coordinator extends the subgraph lock to cover the entire
+cascade set for the duration of the refactor. Any other agent attempting to acquire
+a lock on a node within the cascade subgraph is blocked with the reason:
+
+    Cascade refactor in progress on mutate_data() by agent .
+    Affected subgraph is locked until cascade completes or reverts.
+
+The agent may revert at any point before the cascade completes. Revert triggers
+TTL-style rollback to the pre-lock snapshot for all modified nodes in the cascade
+set, restoring the previous contract in full. Once all dependents have been updated
+and their PostToolUse checks pass, the cascade lock is released atomically and the
+global cache is updated with the new contract state across the entire affected
+subgraph.
+
+The cascade produces a clean audit trail by construction — each step is a documented,
+coordinator-verified contract update in topological order. Silent breaking changes
+that surface as runtime bugs are structurally impossible under this model. The agent
+does the work it would have done anyway; the coordinator ensures it does it completely
+and in the right order.
 
 ### Deadlock resolution — preclaim consensus
 

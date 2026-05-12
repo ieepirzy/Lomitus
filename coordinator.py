@@ -217,6 +217,11 @@ def handle_pretool(
     # Edit/MultiEdit outside every named node (whitespace, comment, between functions):
     # allow without lock. The edit targets no structural node, so there is no CBS conflict
     # to enforce. PostToolUseFailure is the backstop if line content has shifted.
+    #
+    # TODO: destructive edits to benign nodes (e.g. removing an import) should be blocked
+    # when another agent holds any structural lock on the same file. Currently such edits
+    # are allowed unconditionally. Fix: check if any structural lock on file_path is held
+    # by a different agent before allowing a benign-only edit through.
     if not structural_targets:
         allow()
 

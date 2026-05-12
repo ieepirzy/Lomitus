@@ -256,6 +256,12 @@ def update_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> 
     Re-index a file after a write completes (PostToolUse / FileChanged).
     Graph extensions (new imports added) and deletions are both handled by
     index_file's delete-then-reinsert approach.
+
+    TODO: structural deletions (a node or file disappearing entirely) require graph-wide
+    recalculation — other files that imported from the deleted node now have stale edges
+    in the DB. Currently only the edited file is re-indexed; orphaned inbound edges are
+    not detected until those dependent files are next touched. Fix: on any deletion,
+    query all files with edges pointing to file_path and re-index them as well.
     """
     index_file(file_path, project_root, conn)
 
