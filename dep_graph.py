@@ -258,3 +258,93 @@ def update_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> 
     index_file's delete-then-reinsert approach.
     """
     index_file(file_path, project_root, conn)
+
+
+def identify_target_nodes(
+    file_path: str,
+    tool_name: str,
+    tool_input: dict,
+    conn: sqlite3.Connection,
+) -> list[str]:
+    """
+    Determine which node_ids in file_path are targeted by this tool call.
+
+    Edit / MultiEdit: match old_string position to node line ranges.
+    Write: all nodes in the file (full replacement — caller filters to structural).
+    Returns empty list when old_string falls outside any named node (whitespace, comments).
+    """
+    abs_path = str(Path(file_path).resolve())
+
+    if tool_name == "Write":
+        return [r[0] for r in conn.execute(
+            "SELECT node_id FROM nodes WHERE file_path = ?", (abs_path,)
+        ).fetchall()]
+
+    old_strings: list[str] = []
+    if tool_name == "Edit":
+        s = tool_input.get("old_string", "")
+        if s:
+            old_strings.append(s)
+    elif tool_name == "MultiEdit":
+        for edit in tool_input.get("edits", []):
+            s = edit.get("old_string", "")
+            if s:
+                old_strings.append(s)
+
+    if not old_strings:
+        return []
+
+    try:
+        source = Path(abs_path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    rows = conn.execute(
+        "SELECT node_id, line_start, line_end FROM nodes WHERE file_path = ? ORDER BY line_start",
+        (abs_path,),
+    ).fetchall()
+    if not rows:
+        return []
+
+    matched: set[str] = set()
+    for old_string in old_strings:
+        offset = source.find(old_string)
+        if offset == -1:
+            continue
+        edit_line_start = source[:offset].count("\n") + 1
+        edit_line_end   = edit_line_start + old_string.count("\n")
+        for node_id, line_start, line_end in rows:
+            if line_start <= edit_line_end and line_end >= edit_line_start:
+                matched.add(node_id)
+
+    return list(matched)
+
+
+def compute_merkle_root_from_node_ids(
+    node_ids: list[str],
+    conn: sqlite3.Connection,
+) -> str:
+    """
+    Recompute a Merkle root directly from stored node_ids without re-crawling the filesystem.
+    Used at PostToolUse: fetches current content_hashes from the nodes table, which still
+    reflect pre-edit state until update_file() runs. Drift shows up as a root mismatch.
+    """
+    if not node_ids:
+        return hashlib.sha256(b"").hexdigest()
+
+    placeholders = ",".join("?" * len(node_ids))
+    rows = conn.execute(
+        f"SELECT file_path, content_hash FROM nodes WHERE node_id IN ({placeholders})"
+        " ORDER BY file_path, line_start",
+        node_ids,
+    ).fetchall()
+
+    by_file: dict[str, list[str]] = {}
+    for file_path, content_hash in rows:
+        by_file.setdefault(file_path, []).append(content_hash)
+
+    leaf_hashes = [
+        hashlib.sha256(b"".join(h.encode() for h in hashes)).hexdigest()
+        for _, hashes in sorted(by_file.items())
+    ]
+    return hashlib.sha256(b"".join(h.encode() for h in leaf_hashes)).hexdigest()
