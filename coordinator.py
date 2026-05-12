@@ -35,6 +35,26 @@ CREATE TABLE IF NOT EXISTS agents (
     session_id  TEXT,
     registered_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id      TEXT PRIMARY KEY,
+    file_path    TEXT NOT NULL,
+    name         TEXT,
+    kind         TEXT NOT NULL,
+    line_start   INTEGER NOT NULL,
+    line_end     INTEGER NOT NULL,
+    content_hash TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+    from_file    TEXT NOT NULL,
+    to_file      TEXT NOT NULL,
+    PRIMARY KEY (from_file, to_file)
+);
+
+CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
+CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file);
+CREATE INDEX IF NOT EXISTS idx_edges_to   ON edges(to_file);
 """
 
 

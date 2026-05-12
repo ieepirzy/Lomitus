@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""
+dep_graph.py — module-level dependency graph construction for the CBS coordinator.
+
+Nodes are module-level AST constructs (functions, classes, imports, bare statements).
+Edges are cross-file import dependencies within the project.
+Hashes are SHA256 of node source content, not mtimes.
+"""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id      TEXT PRIMARY KEY,
+    file_path    TEXT NOT NULL,
+    name         TEXT,
+    kind         TEXT NOT NULL,
+    line_start   INTEGER NOT NULL,
+    line_end     INTEGER NOT NULL,
+    content_hash TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+    from_file    TEXT NOT NULL,
+    to_file      TEXT NOT NULL,
+    PRIMARY KEY (from_file, to_file)
+);
+
+CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
+CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file);
+CREATE INDEX IF NOT EXISTS idx_edges_to   ON edges(to_file);
+"""
+
+
+@dataclass(frozen=True)
+class Node:
+    node_id: str
+    file_path: str
+    name: str | None
+    kind: Literal["structural", "benign"]
+    line_start: int
+    line_end: int
+    content_hash: str
+
+
+def _classify(stmt: ast.stmt) -> Literal["structural", "benign"]:
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return "structural"
+    return "benign"
+
+
+def _name(stmt: ast.stmt) -> str | None:
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return stmt.name
+    return None
+
+
+def _node_id(file_path: str, stmt: ast.stmt) -> str:
+    label = _name(stmt) or str(stmt.lineno)
+    return f"{file_path}::{label}"
+
+
+def _hash(source: str, stmt: ast.stmt) -> str:
+    segment = ast.get_source_segment(source, stmt) or ""
+    return hashlib.sha256(segment.encode()).hexdigest()
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_absolute(module: str, project_root: Path) -> str | None:
+    parts = module.replace(".", "/")
+    for suffix in (f"{parts}.py", f"{parts}/__init__.py"):
+        candidate = project_root / suffix
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return None
+
+
+def resolve_import(
+    stmt: ast.Import | ast.ImportFrom,
+    from_file: str,
+    project_root: str,
+) -> list[str]:
+    """
+    Resolve an import statement to absolute file paths within the project.
+    Returns empty list for stdlib/third-party imports.
+    Dynamic imports (importlib.import_module with variable target) are unresolvable and silently skipped.
+    """
+    root = Path(project_root).resolve()
+    origin = Path(from_file).resolve()
+    results: list[str] = []
+
+    if isinstance(stmt, ast.ImportFrom):
+        level = stmt.level or 0
+        module = stmt.module or ""
+
+        if level > 0:
+            base = origin.parent
+            for _ in range(level - 1):
+                base = base.parent
+            candidate = (base / module.replace(".", "/")) if module else base
+            for p in (candidate.with_suffix(".py"), candidate / "__init__.py"):
+                if p.is_file() and _is_within(p, root):
+                    results.append(str(p.resolve()))
+                    break
+        else:
+            resolved = _resolve_absolute(module, root)
+            if resolved:
+                results.append(resolved)
+
+    elif isinstance(stmt, ast.Import):
+        for alias in stmt.names:
+            resolved = _resolve_absolute(alias.name, root)
+            if resolved:
+                results.append(resolved)
+
+    return [r for r in results if r != str(origin)]
+
+
+def _parse(file_path: str) -> tuple[str, ast.Module]:
+    source = Path(file_path).read_text(encoding="utf-8")
+    return source, ast.parse(source, filename=file_path)
+
+
+def parse_file(file_path: str) -> list[Node]:
+    """Extract all module-level nodes from a Python file."""
+    abs_path = str(Path(file_path).resolve())
+    source, tree = _parse(abs_path)
+    return [
+        Node(
+            node_id=_node_id(abs_path, stmt),
+            file_path=abs_path,
+            name=_name(stmt),
+            kind=_classify(stmt),
+            line_start=stmt.lineno,
+            line_end=stmt.end_lineno or stmt.lineno,
+            content_hash=_hash(source, stmt),
+        )
+        for stmt in tree.body
+    ]
+
+
+def index_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> None:
+    """
+    Parse a file and upsert its nodes and outbound edges into the DB.
+    Existing rows for this file are replaced atomically — handles additions,
+    modifications, and removals in one pass.
+    """
+    abs_path = str(Path(file_path).resolve())
+    source, tree = _parse(abs_path)
+
+    nodes = [
+        Node(
+            node_id=_node_id(abs_path, stmt),
+            file_path=abs_path,
+            name=_name(stmt),
+            kind=_classify(stmt),
+            line_start=stmt.lineno,
+            line_end=stmt.end_lineno or stmt.lineno,
+            content_hash=_hash(source, stmt),
+        )
+        for stmt in tree.body
+    ]
+
+    import_stmts = [s for s in tree.body if isinstance(s, (ast.Import, ast.ImportFrom))]
+    edges = []
+    for stmt in import_stmts:
+        for target in resolve_import(stmt, abs_path, project_root):
+            edges.append((abs_path, target))
+
+    with conn:
+        conn.execute("DELETE FROM nodes WHERE file_path = ?", (abs_path,))
+        conn.execute("DELETE FROM edges WHERE from_file = ?", (abs_path,))
+
+        conn.executemany(
+            "INSERT INTO nodes (node_id, file_path, name, kind, line_start, line_end, content_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(n.node_id, n.file_path, n.name, n.kind, n.line_start, n.line_end, n.content_hash) for n in nodes],
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO edges (from_file, to_file) VALUES (?, ?)",
+            edges,
+        )
+
+
+def crawl_subgraph(
+    start_file: str,
+    depth: int,
+    conn: sqlite3.Connection,
+    direction: Literal["forward", "reverse", "both"] = "forward",
+) -> set[str]:
+    """
+    BFS from start_file up to depth hops over the import edge graph.
+    forward  — files this file depends on
+    reverse  — files that depend on this file
+    both     — full neighbourhood
+    Returns the set of absolute file paths including start_file.
+    """
+    start = str(Path(start_file).resolve())
+    visited: set[str] = {start}
+    frontier: set[str] = {start}
+
+    for _ in range(depth):
+        next_frontier: set[str] = set()
+        for f in frontier:
+            if direction in ("forward", "both"):
+                rows = conn.execute("SELECT to_file FROM edges WHERE from_file = ?", (f,)).fetchall()
+                next_frontier.update(r[0] for r in rows)
+            if direction in ("reverse", "both"):
+                rows = conn.execute("SELECT from_file FROM edges WHERE to_file = ?", (f,)).fetchall()
+                next_frontier.update(r[0] for r in rows)
+        next_frontier -= visited
+        if not next_frontier:
+            break
+        visited |= next_frontier
+        frontier = next_frontier
+
+    return visited
+
+
+def compute_merkle_root(file_paths: set[str], conn: sqlite3.Connection) -> str:
+    """
+    Compute a Merkle root over a subgraph.
+    Leaf hash: SHA256 of a file's node content_hashes concatenated in line order.
+    Root: SHA256 of sorted leaf hashes.
+    Used as a cheap first-pass drift check — root match implies all nodes match.
+    """
+    leaf_hashes: list[str] = []
+    for fp in sorted(file_paths):
+        rows = conn.execute(
+            "SELECT content_hash FROM nodes WHERE file_path = ? ORDER BY line_start",
+            (fp,),
+        ).fetchall()
+        if rows:
+            leaf = hashlib.sha256(b"".join(r[0].encode() for r in rows)).hexdigest()
+            leaf_hashes.append(leaf)
+
+    return hashlib.sha256(b"".join(h.encode() for h in leaf_hashes)).hexdigest()
+
+
+def update_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> None:
+    """
+    Re-index a file after a write completes (PostToolUse / FileChanged).
+    Graph extensions (new imports added) and deletions are both handled by
+    index_file's delete-then-reinsert approach.
+    """
+    index_file(file_path, project_root, conn)

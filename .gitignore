@@ -1,1 +1,4 @@
 *.pyc
+
+#no need to commit local cache during development
+*.db
