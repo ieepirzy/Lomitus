@@ -1,7 +1,8 @@
 *.pyc
-
 #no need to commit local cache during development
 *.db
+*.db-wal
+.claude/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
