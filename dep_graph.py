@@ -135,6 +135,26 @@ def _parse(file_path: str) -> tuple[str, ast.Module]:
     return source, ast.parse(source, filename=file_path)
 
 
+def is_fresh(file_path: str, conn: sqlite3.Connection) -> bool:
+    """
+    Return True if every stored node hash matches current on-disk content.
+    Used as a guard to skip redundant re-indexing when PostToolUse already
+    updated the cache before a FileChanged event fires for the same edit.
+    """
+    abs_path = str(Path(file_path).resolve())
+    stored = {r[0]: r[1] for r in conn.execute(
+        "SELECT node_id, content_hash FROM nodes WHERE file_path = ?", (abs_path,)
+    ).fetchall()}
+    if not stored:
+        return False
+    try:
+        source, tree = _parse(abs_path)
+    except Exception:
+        return False
+    current = {_node_id(abs_path, stmt): _hash(source, stmt) for stmt in tree.body}
+    return stored == current
+
+
 def parse_file(file_path: str) -> list[Node]:
     """Extract all module-level nodes from a Python file."""
     abs_path = str(Path(file_path).resolve())
@@ -257,13 +277,48 @@ def update_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> 
     Graph extensions (new imports added) and deletions are both handled by
     index_file's delete-then-reinsert approach.
 
-    TODO: structural deletions (a node or file disappearing entirely) require graph-wide
-    recalculation — other files that imported from the deleted node now have stale edges
-    in the DB. Currently only the edited file is re-indexed; orphaned inbound edges are
-    not detected until those dependent files are next touched. Fix: on any deletion,
-    query all files with edges pointing to file_path and re-index them as well.
+    Structural deletions: if nodes disappear (or the file is removed entirely),
+    all files with inbound edges to this file are re-indexed so their edge lists
+    reflect current state and orphaned edges are purged.
     """
+    abs_path = str(Path(file_path).resolve())
+
+    prior_node_ids = {r[0] for r in conn.execute(
+        "SELECT node_id FROM nodes WHERE file_path = ?", (abs_path,)
+    ).fetchall()}
+
+    if not Path(abs_path).is_file():
+        # File deleted — query dependents before purging edges, then clean up.
+        dependent_files = [r[0] for r in conn.execute(
+            "SELECT from_file FROM edges WHERE to_file = ?", (abs_path,)
+        ).fetchall()]
+        with conn:
+            conn.execute("DELETE FROM nodes WHERE file_path = ?", (abs_path,))
+            conn.execute("DELETE FROM edges WHERE from_file = ? OR to_file = ?", (abs_path, abs_path))
+        for dep in dependent_files:
+            if Path(dep).is_file():
+                try:
+                    index_file(dep, project_root, conn)
+                except Exception:
+                    pass
+        return
+
     index_file(file_path, project_root, conn)
+
+    if prior_node_ids:
+        new_node_ids = {r[0] for r in conn.execute(
+            "SELECT node_id FROM nodes WHERE file_path = ?", (abs_path,)
+        ).fetchall()}
+        if prior_node_ids - new_node_ids:
+            dependent_files = [r[0] for r in conn.execute(
+                "SELECT from_file FROM edges WHERE to_file = ?", (abs_path,)
+            ).fetchall()]
+            for dep in dependent_files:
+                if dep != abs_path and Path(dep).is_file():
+                    try:
+                        index_file(dep, project_root, conn)
+                    except Exception:
+                        pass
 
 
 def identify_target_nodes(

@@ -40,6 +40,7 @@ from dep_graph import (
     compute_merkle_root_from_node_ids,
     identify_target_nodes,
     index_file,
+    is_fresh,
     crawl_subgraph,
     update_file,
 )
@@ -84,6 +85,13 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE TABLE IF NOT EXISTS bloom_state (
     id       INTEGER PRIMARY KEY CHECK (id = 1),
     bitarray BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worktrees (
+    worktree_path TEXT PRIMARY KEY,
+    agent_id      TEXT,
+    session_id    TEXT,
+    created_at    TEXT DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_locks_file ON locks(file_path);
@@ -215,14 +223,19 @@ def handle_pretool(
         structural_targets = [_file_sentinel(file_path)]
 
     # Edit/MultiEdit outside every named node (whitespace, comment, between functions):
-    # allow without lock. The edit targets no structural node, so there is no CBS conflict
-    # to enforce. PostToolUseFailure is the backstop if line content has shifted.
-    #
-    # TODO: destructive edits to benign nodes (e.g. removing an import) should be blocked
-    # when another agent holds any structural lock on the same file. Currently such edits
-    # are allowed unconditionally. Fix: check if any structural lock on file_path is held
-    # by a different agent before allowing a benign-only edit through.
+    # allow without lock — unless another agent holds a structural lock on this file.
+    # A benign edit (e.g. removing an import) can invalidate a concurrent structural edit
+    # being reasoned about by the lock holder.
     if not structural_targets:
+        other_lock = conn.execute(
+            "SELECT agent_id FROM locks WHERE file_path = ? AND agent_id != ? LIMIT 1",
+            (file_path, agent_id),
+        ).fetchone()
+        if other_lock:
+            block(
+                f"Benign edit on '{Path(file_path).name}' blocked — "
+                f"'{other_lock[0]}' holds a structural lock on this file. Replan."
+            )
         allow()
 
     # 3. Crawl 1 edge forward (enforcement depth) and cold-cache any unseen deps.
@@ -403,27 +416,176 @@ def handle_failure(file_path: str, agent_id: str, conn: sqlite3.Connection) -> N
 
 
 # ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _release_agent_locks(agent_id: str, conn: sqlite3.Connection) -> None:
+    """Release all locks held by agent_id without updating cache (no edit confirmation)."""
+    locked = conn.execute(
+        "SELECT node_id FROM locks WHERE agent_id = ?", (agent_id,)
+    ).fetchall()
+    conn.execute("DELETE FROM locks WHERE agent_id = ?", (agent_id,))
+    conn.commit()
+    if locked:
+        bloom = load_bloom(conn)
+        for (nid,) in locked:
+            bloom.remove(nid)
+        save_bloom(conn, bloom)
+
+
+def _warm_from_file(file_path: str, depth: int, project_root: str, conn: sqlite3.Connection) -> None:
+    """Re-index file_path if stale, then warm depth edges forward.
+    Skips re-indexing when hashes already match — guards against double-indexing
+    when PostToolUse runs before a FileChanged event fires for the same edit."""
+    if not Path(file_path).is_file():
+        return
+    if not is_fresh(file_path, conn):
+        update_file(file_path, project_root, conn)
+    dep_files = crawl_subgraph(file_path, depth=depth, conn=conn, direction="forward")
+    for f in dep_files - {file_path}:
+        if not is_indexed(f, conn) and Path(f).is_file():
+            try:
+                index_file(f, project_root, conn)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Passive hook handlers
+# ---------------------------------------------------------------------------
+
+def handle_session_start(_payload: dict, _conn: sqlite3.Connection) -> None:
+    # DB is already initialized by get_db().
+    sys.exit(0)
+
+
+def handle_session_end(session_id: str, conn: sqlite3.Connection) -> None:
+    locked = conn.execute("SELECT node_id FROM locks").fetchall()
+    conn.execute("DELETE FROM locks")
+    conn.execute("DELETE FROM agents WHERE session_id = ?", (session_id,))
+    conn.commit()
+    if locked:
+        bloom = load_bloom(conn)
+        for (nid,) in locked:
+            bloom.remove(nid)
+        save_bloom(conn, bloom)
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    sys.exit(0)
+
+
+def handle_subagent_start(payload: dict, conn: sqlite3.Connection) -> None:
+    agent_id      = payload.get("agent_id") or payload.get("session_id", "unknown")
+    agent_type    = payload.get("agent_type")
+    session_id    = payload.get("session_id", "")
+    worktree_path = payload.get("worktree_path", "")
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO agents (agent_id, agent_type, session_id) VALUES (?, ?, ?)",
+            (agent_id, agent_type, session_id),
+        )
+        if worktree_path:
+            conn.execute(
+                "INSERT OR REPLACE INTO worktrees (worktree_path, agent_id, session_id) VALUES (?, ?, ?)",
+                (worktree_path, agent_id, session_id),
+            )
+    sys.exit(0)
+
+
+def handle_subagent_stop(payload: dict, conn: sqlite3.Connection) -> None:
+    agent_id = payload.get("agent_id") or payload.get("session_id", "unknown")
+    _release_agent_locks(agent_id, conn)
+    sys.exit(0)
+
+
+def handle_file_changed(payload: dict, conn: sqlite3.Connection) -> None:
+    file_path = str(Path(payload.get("file_path", "")).resolve())
+    if not file_path or file_path == str(Path("").resolve()):
+        sys.exit(0)
+    project_root = find_project_root(file_path)
+    _warm_from_file(file_path, depth=2, project_root=project_root, conn=conn)
+    sys.exit(0)
+
+
+def handle_cwd_changed(payload: dict, conn: sqlite3.Connection) -> None:
+    cwd = payload.get("cwd", "")
+    if not cwd:
+        sys.exit(0)
+    cwd_path = Path(cwd)
+    if not cwd_path.is_dir():
+        sys.exit(0)
+    project_root = find_project_root(str(cwd_path))
+    for py_file in cwd_path.glob("*.py"):
+        try:
+            _warm_from_file(str(py_file.resolve()), depth=2, project_root=project_root, conn=conn)
+        except Exception:
+            continue
+    sys.exit(0)
+
+
+def handle_worktree_create(payload: dict, conn: sqlite3.Connection) -> None:
+    worktree_path = payload.get("worktree_path", "")
+    if not worktree_path:
+        sys.exit(0)
+    agent_id   = payload.get("agent_id") or payload.get("session_id", "unknown")
+    session_id = payload.get("session_id", "")
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO worktrees (worktree_path, agent_id, session_id) VALUES (?, ?, ?)",
+            (worktree_path, agent_id, session_id),
+        )
+    sys.exit(0)
+
+
+def handle_worktree_remove(payload: dict, conn: sqlite3.Connection) -> None:
+    worktree_path = payload.get("worktree_path", "")
+    if not worktree_path:
+        sys.exit(0)
+    rows = conn.execute(
+        "SELECT agent_id FROM worktrees WHERE worktree_path = ?", (worktree_path,)
+    ).fetchall()
+    for (agent_id,) in rows:
+        _release_agent_locks(agent_id, conn)
+    with conn:
+        conn.execute("DELETE FROM worktrees WHERE worktree_path = ?", (worktree_path,))
+    sys.exit(0)
+
+
+def handle_post_tool_batch(_conn: sqlite3.Connection) -> None:
+    # v1 no-op: batch-level validation is a v2 concern.
+    sys.exit(0)
+
+
+def handle_pre_compact(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    mode = "pretool"
-    if "--release" in sys.argv:
-        mode = "release"
-    elif "--failure" in sys.argv:
-        mode = "failure"
+    args = set(sys.argv[1:])
+
+    if   "--session-start"   in args: mode = "session_start"
+    elif "--session-end"     in args: mode = "session_end"
+    elif "--subagent-start"  in args: mode = "subagent_start"
+    elif "--subagent-stop"   in args: mode = "subagent_stop"
+    elif "--file-changed"    in args: mode = "file_changed"
+    elif "--cwd-changed"     in args: mode = "cwd_changed"
+    elif "--worktree-create" in args: mode = "worktree_create"
+    elif "--worktree-remove" in args: mode = "worktree_remove"
+    elif "--post-tool-batch" in args: mode = "post_tool_batch"
+    elif "--pre-compact"     in args: mode = "pre_compact"
+    elif "--release"         in args: mode = "release"
+    elif "--failure"         in args: mode = "failure"
+    else:                             mode = "pretool"
 
     try:
         payload = parse_hook_input()
     except Exception:
         if mode == "pretool":
             block("Coordinator error: cannot parse hook payload.")
-        sys.exit(0)
-
-    file_path, agent_id, agent_type, session_id, tool_name, tool_input = extract_context(payload)
-
-    empty_path = str(Path("").resolve())
-    if not file_path or file_path == empty_path:
         sys.exit(0)
 
     try:
@@ -434,11 +596,37 @@ def main() -> None:
         sys.exit(0)
 
     if mode == "pretool":
+        file_path, agent_id, agent_type, session_id, tool_name, tool_input = extract_context(payload)
+        empty_path = str(Path("").resolve())
+        if not file_path or file_path == empty_path:
+            sys.exit(0)
         handle_pretool(file_path, agent_id, agent_type, tool_name, tool_input, conn)
     elif mode == "release":
+        file_path, agent_id, *_ = extract_context(payload)
         handle_release(file_path, agent_id, conn)
     elif mode == "failure":
+        file_path, agent_id, *_ = extract_context(payload)
         handle_failure(file_path, agent_id, conn)
+    elif mode == "session_start":
+        handle_session_start(payload, conn)
+    elif mode == "session_end":
+        handle_session_end(payload.get("session_id", ""), conn)
+    elif mode == "subagent_start":
+        handle_subagent_start(payload, conn)
+    elif mode == "subagent_stop":
+        handle_subagent_stop(payload, conn)
+    elif mode == "file_changed":
+        handle_file_changed(payload, conn)
+    elif mode == "cwd_changed":
+        handle_cwd_changed(payload, conn)
+    elif mode == "worktree_create":
+        handle_worktree_create(payload, conn)
+    elif mode == "worktree_remove":
+        handle_worktree_remove(payload, conn)
+    elif mode == "post_tool_batch":
+        handle_post_tool_batch(conn)
+    elif mode == "pre_compact":
+        handle_pre_compact(conn)
 
 
 if __name__ == "__main__":
