@@ -42,3 +42,10 @@ def list_items(owner_id: Optional[int] = None) -> List[Item]:
     if owner_id is not None:
         items = [i for i in items if i.owner_id == owner_id]
     return items
+
+
+def delete_item(item_id: int) -> bool:
+    if item_id in _items:
+        del _items[item_id]
+        return True
+    return False
