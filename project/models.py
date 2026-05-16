@@ -22,4 +22,5 @@ class Item:
     description: str = ""
     price: float = 0.0
     tags: list[str] = field(default_factory=list)
+    weight: float = 0.0
     created_at: datetime = field(default_factory=datetime.utcnow)
