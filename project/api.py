@@ -33,3 +33,8 @@ def list_items(owner_id: int | None = None) -> List[Item]:
 def create_item(name: str, owner_id: int, description: str = "") -> Item:
     get_user(owner_id)  # validates owner exists
     return storage.create_item(name=name, owner_id=owner_id, description=description)
+
+
+def delete_item(item_id: int) -> None:
+    if not storage.delete_item(item_id):
+        raise KeyError(f"Item {item_id} not found")
