@@ -1496,20 +1496,16 @@ def handle_session_end(session_id: str, conn: sqlite3.Connection) -> None:
 
 
 def handle_subagent_start(payload: dict, conn: sqlite3.Connection) -> None:
-    agent_id      = payload.get("agent_id") or payload.get("session_id", "unknown")
-    agent_type    = payload.get("agent_type")
-    session_id    = payload.get("session_id", "")
-    worktree_path = payload.get("worktree_path", "")
+    agent_id   = payload.get("agent_id") or payload.get("session_id", "unknown")
+    agent_type = payload.get("agent_type")
+    session_id = payload.get("session_id", "")
+    # Worktree registration is handled by the WorktreeCreate hook; SubagentStart
+    # payload only carries agent_id, agent_type, session_id.
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO agents (agent_id, agent_type, session_id) VALUES (?, ?, ?)",
             (agent_id, agent_type, session_id),
         )
-        if worktree_path:
-            conn.execute(
-                "INSERT OR REPLACE INTO worktrees (worktree_path, agent_id, session_id) VALUES (?, ?, ?)",
-                (worktree_path, agent_id, session_id),
-            )
     sys.exit(0)
 
 
@@ -1523,8 +1519,14 @@ def handle_file_changed(payload: dict, conn: sqlite3.Connection) -> None:
     file_path = str(Path(payload.get("file_path", "")).resolve())
     if not file_path or file_path == str(Path("").resolve()):
         sys.exit(0)
+    event = payload.get("event", "change")  # 'change' | 'add' | 'unlink'
     project_root = find_project_root(file_path)
-    _warm_from_file(file_path, depth=2, project_root=project_root, conn=conn)
+    if event == "unlink":
+        # File deleted — purge its nodes/edges and re-index dependents so the
+        # graph doesn't carry stale edges pointing to a gone file.
+        update_file(file_path, project_root, conn)
+    else:
+        _warm_from_file(file_path, depth=2, project_root=project_root, conn=conn)
     sys.exit(0)
 
 
