@@ -418,7 +418,7 @@ GPLv3. Commercial products may ship the coordinator as an unmodified subprocess.
 
 ---
 
-## OPEN TODOs (16.05.2026):
+## OPEN TODOs (16.05.2026)
 
 The Strategic Path forward: Replacing the Git Transport Layer
 Since you've proven that your SQLite dependency tracker perfectly gates execution, the Git CLI is acting as a redundant, slow database layer.
@@ -436,6 +436,212 @@ Since you've proven that your SQLite dependency tracker perfectly gates executio
 Instead of running _auto_commit_and_push via process forks, your coordinator can copy the validated structural node text changes directly into the canonical main repo directory via Python filesystem operations, updating your nodes table instantly.
 
 You then defer Git compilation entirely to SessionEnd
+
+## IDEAS FOR I/O CONTRACTS
+
+Optimizing contract.py without introducing an LLM
+To elevate your execution-based approach to a highly reliable layer, you can extend your AST parse path to implement Automated Context Injections:
+
+A. Deep Token Type Mocking
+When a type hint isn't a scalar (like int or str), parse the type string to see if it belongs to a known dataclass or structural model within your nodes database cache. Since you've already indexed the codebase into SQLite, if a function takes a user: User, your coordinator can query the nodes table for User, look up its fields, and automatically instantiate a mock object payload for the subprocess script instead of giving up with None.
+
+B. Structural Isolation
+Instead of just blacklisting calls inside the function body, use ast.NodeTransformer within your parser to strip out or stub any top-level module statements that aren't class or function definitions before writing the dynamic file to the snapshot interpreter. This ensures that simply importing the target file never triggers an accidental external initialization loop.
+
+## Edge cases in dep_graph.py:
+
+When mapping an explicit AST to a relational database for deterministic runtime validation, several subtle edge-case interactions become apparent:
+
+1. The Multi-Match Target Collateral (The "Stretching Node" Trap)
+Look closely at identify_target_nodes for an Edit or MultiEdit call:
+
+```python
+edit_line_start = source[:offset].count("\n") + 1
+edit_line_end   = edit_line_start + old_string.count("\n")
+for node_id, line_start, line_end in rows:
+    if line_start <= edit_line_end and line_end >= edit_line_start:
+        matched.add(node_id)
+```
+
+If an agent is editing a large class or function, and they replace an old_string that happens to structurally match code found in both a target function and a trailing wrapper block (or if the edit overlaps structural boundaries, like updating an un-scoped variable at line 40 that bleeds into line 41), identify_target_nodes will return multiple structural node IDs.
+
+Because lock acquisition is all-or-nothing:
+
+```python
+with conn:
+    for nid in structural_targets:
+        conn.execute("INSERT INTO locks ...")
+```
+
+If an edit spans across boundaries or triggers a multi-match, the agent will accidentally claim locks on nodes it never intended to edit. This is safe, but it increases the lock collision surface area at scale.
+
+2. The Asymmetric Invalidation Cascade
+Your graph update logic inside update_file handles structural deletions flawlessly:
+
+```python
+if prior_node_ids - new_node_ids:
+    dependent_files = [r[0] for r in conn.execute(
+        "SELECT from_file FROM edges WHERE to_file = ?", (abs_path,)
+    ).fetchall()]
+    for dep in dependent_files:
+        if dep != abs_path and Path(dep).is_file():
+            index_file(dep, project_root, conn)
+```
+If a method is removed or renamed, you re-index its dependent files to see if their imports broke or changed.
+
+However, look at what happens if Agent A adds an entirely new import statement to an existing file during an allowed edit. index_file runs a clean purge-and-reinsert:
+
+```python
+conn.execute("DELETE FROM edges WHERE from_file = ?", (abs_path,))
+# ...
+conn.executemany("INSERT OR IGNORE INTO edges (from_file, to_file) VALUES (?, ?)", edges)
+```
+
+The new dependency edge lands instantly in the database. But if Agent B is currently holding a subgraph lock that now includes this newly connected edge as a 1-hop forward target, Agent B's PostToolBatch or PostToolUse will immediately fail its Merkle check, detect an unexpected environmental drift, and reject Agent B's edit, even though Agent B didn't touch the file Agent A just modified.
+
+## Resolving var placeholder limitation
+
+Resolving the var Placeholder Limitation
+In contract.py, falling back to a dummy placeholder "var" (which maps to None at execution time) for unresolvable complex objects is a significant roadblock for real-world codebases like Django, FastAPI, or SQLAlchemy, where almost everything inherits from custom models or handles structured contexts.
+
+Since dep_graph.py gives you an incredibly accurate, queryable map of every structural node in the codebase, you can pass this information directly to contract.py to solve the object resolution deficit.
+
+Instead of abandoning typing or using simple scalar defaults, you can leverage your parsed database entries to build Synthetic Structural Mock Generics:
+
+```python
+# Conceptual extension inside contract.py using your nodes table cache
+def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection) -> Any:
+    # Check if this annotation name matches a ClassDef we have indexed
+    row = conn.execute(
+        "SELECT node_id, file_path FROM nodes WHERE name = ? AND kind = 'structural' LIMIT 1",
+        (annotation_name,)
+    ).fetchone()
+    
+    if row:
+        # We found the class definition! We can construct a lightweight 
+        # dynamic Python Mock object that mirrors its expected attributes
+        class SyntheticMock:
+            def __init__(self):
+                # Dynamically inject defaults or simple mock returns
+                pass
+            def __getattr__(self, item):
+                return None # Graceful attribute fallback to prevent AttributeError
+        return SyntheticMock()
+        
+    return None # Fallback to standard None if completely unindexed
+```
+Thank you for sharing dep_graph.py—this provides the exact technical anchor to see how the mathematical guarantees are built. Seeing the concrete implementation of both the static analysis layer and the indexing mechanism clarifies the entire graph life cycle.
+
+My previous analysis of _subgraph_stale missed a crucial architecture detail that your codebase elegant addresses: compute_merkle_root does preserve the topology perfectly!
+
+Python
+leaf = hashlib.sha256(b"".join(r[0].encode() for r in rows)).hexdigest()
+leaf_hashes.append(leaf)
+...
+return hashlib.sha256(b"".join(h.encode() for h in leaf_hashes)).hexdigest()
+By grouping individual content_hash strings by file path, sorting them by line position, creating a file-level leaf hash, and then hashing the sorted leaf collection, you have effectively built a deterministic two-tiered hierarchical Merkel Tree.
+
+Technical Deep-Dive & Edge Cases in dep_graph.py
+When mapping an explicit AST to a relational database for deterministic runtime validation, several subtle edge-case interactions become apparent:
+
+1. The Multi-Match Target Collateral (The "Stretching Node" Trap)
+Look closely at identify_target_nodes for an Edit or MultiEdit call:
+
+Python
+edit_line_start = source[:offset].count("\n") + 1
+edit_line_end   = edit_line_start + old_string.count("\n")
+for node_id, line_start, line_end in rows:
+    if line_start <= edit_line_end and line_end >= edit_line_start:
+        matched.add(node_id)
+If an agent is editing a large class or function, and they replace an old_string that happens to structurally match code found in both a target function and a trailing wrapper block (or if the edit overlaps structural boundaries, like updating an un-scoped variable at line 40 that bleeds into line 41), identify_target_nodes will return multiple structural node IDs.
+
+Because lock acquisition is all-or-nothing:
+
+Python
+with conn:
+    for nid in structural_targets:
+        conn.execute("INSERT INTO locks ...")
+If an edit spans across boundaries or triggers a multi-match, the agent will accidentally claim locks on nodes it never intended to edit. This is safe, but it increases the lock collision surface area at scale.
+
+2. The Asymmetric Invalidation Cascade
+Your graph update logic inside update_file handles structural deletions flawlessly:
+
+Python
+if prior_node_ids - new_node_ids:
+    dependent_files = [r[0] for r in conn.execute(
+        "SELECT from_file FROM edges WHERE to_file = ?", (abs_path,)
+    ).fetchall()]
+    for dep in dependent_files:
+        if dep != abs_path and Path(dep).is_file():
+            index_file(dep, project_root, conn)
+If a method is removed or renamed, you re-index its dependent files to see if their imports broke or changed.
+
+However, look at what happens if Agent A adds an entirely new import statement to an existing file during an allowed edit. index_file runs a clean purge-and-reinsert:
+
+Python
+conn.execute("DELETE FROM edges WHERE from_file = ?", (abs_path,))
+# ...
+conn.executemany("INSERT OR IGNORE INTO edges (from_file, to_file) VALUES (?, ?)", edges)
+The new dependency edge lands instantly in the database. But if Agent B is currently holding a subgraph lock that now includes this newly connected edge as a 1-hop forward target, Agent B's PostToolBatch or PostToolUse will immediately fail its Merkle check, detect an unexpected environmental drift, and reject Agent B's edit, even though Agent B didn't touch the file Agent A just modified.
+
+Resolving the var Placeholder Limitation
+In contract.py, falling back to a dummy placeholder "var" (which maps to None at execution time) for unresolvable complex objects is a significant roadblock for real-world codebases like Django, FastAPI, or SQLAlchemy, where almost everything inherits from custom models or handles structured contexts.
+
+Since dep_graph.py gives you an incredibly accurate, queryable map of every structural node in the codebase, you can pass this information directly to contract.py to solve the object resolution deficit.
+
+Instead of abandoning typing or using simple scalar defaults, you can leverage your parsed database entries to build Synthetic Structural Mock Generics:
+
+Python
+# Conceptual extension inside contract.py using your nodes table cache
+def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection) -> Any:
+    # Check if this annotation name matches a ClassDef we have indexed
+    row = conn.execute(
+        "SELECT node_id, file_path FROM nodes WHERE name = ? AND kind = 'structural' LIMIT 1",
+        (annotation_name,)
+    ).fetchone()
+    
+    if row:
+        # We found the class definition! We can construct a lightweight 
+        # dynamic Python Mock object that mirrors its expected attributes
+        class SyntheticMock:
+            def __init__(self):
+                # Dynamically inject defaults or simple mock returns
+                pass
+            def __getattr__(self, item):
+                return None # Graceful attribute fallback to prevent AttributeError
+        return SyntheticMock()
+        
+    return None # Fallback to standard None if completely unindexed
+By returning a basic object wrapped in a graceful __getattr__ safety switch instead of a raw standard NoneType, your execution runner will glide right past missing attribute assignments (request.user.id will cleanly evaluate to None instead of crashing with a fatal AttributeError), allowing you to extract structural I/O snapshots from highly complex code bases.
+
+## Eliminating cache population latency
+
+Your lazy caching methodology is clean:
+
+PreToolUse enforces a precise 1-edge-deep scan.
+
+Passive hooks (FileChanged, CwdChanged) warm the graph 2–3 edges out in the background.
+
+At a massive scale of 100 to 500 parallel agents, this architecture can completely decouple from disk reads by utilizing an In-Memory Graph State Cache.
+
+Since dep_graph.py writes directly to a centralized WAL-mode SQLite database, you can load the edges table into a fast, thread-safe in-memory graph structure (like a dict of sets) at SessionStart. Your BFS traversals inside crawl_subgraph can run at pure memory speeds without executing any SQL relational joins, reserving SQLite exclusively for holding long-lived transaction locks and content hashes.
+
+## Other possible edge cases:
+
+In dep_graph.py, when a file or node is structurally mutated or deleted, you proactively re-index its reverse dependents to ensure that the global edge list remains pristine:
+
+```python
+if prior_node_ids - new_node_ids:
+    dependent_files = [r[0] for r in conn.execute("SELECT from_file FROM edges WHERE to_file = ?", (abs_path,)).fetchall()]
+    for dep in dependent_files:
+        index_file(dep, project_root, conn)
+```
+
+The Edge Case: If Agent A removes a function signature, it triggers this recursive re-indexing across all files that import it. If Agent B is simultaneously attempting to acquire a lock in one of those dependent files, Agent B's PreToolUse loop might hit a lock contention issue on the SQLite database while index_file(dep) is writing its new nodes.
+
+To harden this for 500 agents, wrap these cascading dependent re-indexes inside a deferred background task or queue, rather than running them synchronously inside the active PostToolUse release window of the writing agent.
+
+---
 
 *Design developed May 2026.*
 © Ilari Pirkkalainen [ieepirzy](https://github.com/ieepirzy) 2026
