@@ -5,10 +5,14 @@ coordinator.py — multi-agent subgraph lock coordinator, v1.
 Reads hook context from stdin (JSON). Exits 0 (allow) or 2 (block).
 
 Flags:
-  (none)            PreToolUse         — conflict check, lock acquisition, subgraph snapshot
-  --release         PostToolUse        — drift check, global cache update, lock release
-  --failure         PostToolUseFailure — silent lock release, no cache update
-  --crawl-project   manual / session-start — recursively index all .py files in project root
+  (none)              PreToolUse         — conflict check, lock acquisition, subgraph snapshot
+  --release           PostToolUse        — drift check, global cache update, lock release
+  --failure           PostToolUseFailure — silent lock release, no cache update
+  --crawl-project     manual / session-start — recursively index all .py files in project root
+  --worktree-create   create a git worktree + branch for an agent, register in DB
+  --worktree-push     merge agent branch → main, re-index changed files in canonical DB
+  --worktree-pull     rebase agent worktree onto latest main, update base_commit in DB
+  --worktree-remove   remove worktree + branch, release all agent locks
 
 Usage in .claude/settings.json:
 {
@@ -33,6 +37,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import sys
 import uuid as _uuid
 from pathlib import Path
@@ -45,6 +50,7 @@ from dep_graph import (
     is_fresh,
     crawl_subgraph,
     update_file,
+    parse_file,
 )
 from bloom import load_bloom, save_bloom
 from contract import capture_node_snapshot, is_superset, take_snapshot
@@ -94,6 +100,8 @@ CREATE TABLE IF NOT EXISTS worktrees (
     worktree_path TEXT PRIMARY KEY,
     agent_id      TEXT,
     session_id    TEXT,
+    branch_name   TEXT,
+    base_commit   TEXT,
     created_at    TEXT DEFAULT (datetime('now'))
 );
 
@@ -172,6 +180,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(locks)").fetchall()}
     if "expires_at" not in cols:
         conn.execute("ALTER TABLE locks ADD COLUMN expires_at TEXT")
+    # v2 → v3: add branch_name and base_commit to worktrees.
+    wt_cols = {r[1] for r in conn.execute("PRAGMA table_info(worktrees)").fetchall()}
+    if "branch_name" not in wt_cols:
+        conn.execute("ALTER TABLE worktrees ADD COLUMN branch_name TEXT")
+    if "base_commit" not in wt_cols:
+        conn.execute("ALTER TABLE worktrees ADD COLUMN base_commit TEXT")
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +195,71 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 def _is_python(file_path: str) -> bool:
     return Path(file_path).suffix == ".py"
+
+
+# ---------------------------------------------------------------------------
+# Git worktree helpers
+# ---------------------------------------------------------------------------
+
+def _git(args: list[str], cwd: str) -> tuple[int, str, str]:
+    r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def _main_repo_root(worktree_path: str) -> str:
+    """Return the root of the main (canonical) repo given any worktree path."""
+    _, common_dir, _ = _git(["rev-parse", "--git-common-dir"], cwd=worktree_path)
+    git_path = Path(common_dir)
+    if not git_path.is_absolute():
+        git_path = (Path(worktree_path) / git_path).resolve()
+    return str(git_path.parent)
+
+
+def _worktree_to_canonical(file_path: str, conn: sqlite3.Connection) -> str | None:
+    """
+    If file_path lives inside a registered worktree, return the equivalent
+    path in the main repo. Returns None if the file is already in the main repo.
+    """
+    abs_path = str(Path(file_path).resolve())
+    for (wt_path,) in conn.execute("SELECT worktree_path FROM worktrees").fetchall():
+        wt_abs = str(Path(wt_path).resolve())
+        if abs_path.startswith(wt_abs + "/"):
+            rel = abs_path[len(wt_abs):].lstrip("/")
+            try:
+                main_root = _main_repo_root(wt_path)
+            except Exception:
+                return None
+            return str(Path(main_root) / rel)
+    return None
+
+
+def _agent_view_stale(file_path: str, conn: sqlite3.Connection) -> list[str]:
+    """
+    Return a list of node names where the agent's worktree copy differs from
+    the canonical DB state. An empty list means the view is current.
+    """
+    canonical_path = _worktree_to_canonical(file_path, conn)
+    if not canonical_path:
+        return []
+    db_nodes = {
+        r[0]: r[1]
+        for r in conn.execute(
+            "SELECT node_id, content_hash FROM nodes WHERE file_path = ?",
+            (str(Path(canonical_path).resolve()),),
+        ).fetchall()
+    }
+    if not db_nodes:
+        return []
+    try:
+        agent_nodes = {n.name: n.content_hash for n in parse_file(file_path) if n.name}
+    except Exception:
+        return []
+    stale = []
+    for node_id, db_hash in db_nodes.items():
+        name = node_id.split("::")[-1]
+        if name in agent_nodes and agent_nodes[name] != db_hash:
+            stale.append(name)
+    return stale
 
 
 def find_project_root(start: str) -> str:
@@ -469,8 +549,23 @@ def handle_pretool(
 
     project_root = find_project_root(file_path)
 
+    # 0. Staleness check: if this agent is working in a worktree and the canonical
+    #    DB has advanced past what the agent last observed, block immediately so the
+    #    agent replans against the current state rather than writing on top of stale code.
+    stale_nodes = _agent_view_stale(file_path, conn)
+    if stale_nodes:
+        block(
+            f"Agent's view of '{Path(file_path).name}' is stale — canonical state has "
+            f"advanced on: {', '.join(stale_nodes)}. "
+            f"Run --worktree-pull to rebase onto latest main, then replan."
+        )
+
     # 1. Cold cache: ensure target is indexed before any node lookups.
-    if not is_indexed(file_path, conn):
+    # Guard: skip index_file for non-existent files (Write to a new file).
+    # Without this guard, index_file raises FileNotFoundError, coordinator exits
+    # non-zero (treated as "allow" by Claude Code), and no lock is ever acquired —
+    # every subsequent agent walks through silently on the same new file.
+    if not is_indexed(file_path, conn) and Path(file_path).is_file():
         index_file(file_path, project_root, conn)
 
     # 2. Identify which nodes this edit targets; filter to structural/external.
@@ -986,30 +1081,229 @@ def handle_crawl_project(payload: dict, conn: sqlite3.Connection) -> None:
 
 
 def handle_worktree_create(payload: dict, conn: sqlite3.Connection) -> None:
+    """
+    Create a git worktree for an agent and register it in the DB.
+
+    Payload:
+        worktree_path  — absolute path where the worktree should be created
+        agent_id       — agent identifier (used as the branch name)
+        session_id     — session identifier
+        branch_name    — optional explicit branch name (default: agent_id)
+
+    Invoke via:
+        echo '{"agent_id": "agent-1", "worktree_path": "/tmp/wt-agent-1"}' \\
+            | python coordinator.py --worktree-create
+    """
     worktree_path = payload.get("worktree_path", "")
     if not worktree_path:
         sys.exit(0)
-    agent_id   = payload.get("agent_id") or payload.get("session_id", "unknown")
-    session_id = payload.get("session_id", "")
+    agent_id    = payload.get("agent_id") or payload.get("session_id", "unknown")
+    session_id  = payload.get("session_id", "")
+    branch_name = payload.get("branch_name") or f"agent/{agent_id}"
+
+    # Resolve the main repo root from the current working directory.
+    try:
+        main_root = _main_repo_root(str(Path.cwd()))
+    except Exception:
+        print(f"worktree-create: could not find git root", file=sys.stderr)
+        sys.exit(1)
+
+    # Create the worktree + branch.
+    rc, _, err = _git(
+        ["worktree", "add", worktree_path, "-b", branch_name],
+        cwd=main_root,
+    )
+    if rc != 0:
+        # Branch may already exist (idempotent re-registration).
+        rc2, _, err2 = _git(
+            ["worktree", "add", worktree_path, branch_name],
+            cwd=main_root,
+        )
+        if rc2 != 0:
+            print(f"worktree-create: git error: {err or err2}", file=sys.stderr)
+            sys.exit(1)
+
+    # Record the HEAD commit so staleness checks have a baseline.
+    _, base_commit, _ = _git(["rev-parse", "HEAD"], cwd=worktree_path)
+
     with conn:
         conn.execute(
-            "INSERT OR REPLACE INTO worktrees (worktree_path, agent_id, session_id) VALUES (?, ?, ?)",
-            (worktree_path, agent_id, session_id),
+            "INSERT OR REPLACE INTO worktrees "
+            "(worktree_path, agent_id, session_id, branch_name, base_commit) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (worktree_path, agent_id, session_id, branch_name, base_commit),
         )
+    print(
+        f"worktree-create: '{branch_name}' at '{worktree_path}' (base {base_commit[:8]})",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+
+def handle_worktree_push(payload: dict, conn: sqlite3.Connection) -> None:
+    """
+    Merge an agent's worktree branch into main and re-index changed files in
+    the canonical DB so subsequent agents see the updated state.
+
+    Payload:
+        worktree_path  — path to the agent's worktree
+        agent_id       — agent identifier
+
+    Invoke via:
+        echo '{"agent_id": "agent-1", "worktree_path": "/tmp/wt-agent-1"}' \\
+            | python coordinator.py --worktree-push
+    """
+    worktree_path = payload.get("worktree_path", "")
+    agent_id      = payload.get("agent_id") or payload.get("session_id", "unknown")
+    if not worktree_path:
+        print("worktree-push: worktree_path required", file=sys.stderr)
+        sys.exit(1)
+
+    row = conn.execute(
+        "SELECT branch_name FROM worktrees WHERE worktree_path = ?", (worktree_path,)
+    ).fetchone()
+    branch_name = row[0] if row else None
+
+    try:
+        main_root = _main_repo_root(worktree_path)
+    except Exception:
+        print("worktree-push: could not resolve main repo root", file=sys.stderr)
+        sys.exit(1)
+
+    if not branch_name:
+        print("worktree-push: worktree not registered in coordinator DB", file=sys.stderr)
+        sys.exit(1)
+
+    # Merge the agent branch into main with a merge commit (--no-ff preserves history).
+    rc, _, err = _git(
+        ["merge", branch_name, "--no-ff", "-m",
+         f"coordinator: merge {branch_name} ({agent_id})"],
+        cwd=main_root,
+    )
+    if rc != 0:
+        print(f"worktree-push: merge failed — {err}. Resolve conflicts then retry.", file=sys.stderr)
+        sys.exit(1)
+
+    # Re-index files that changed in the merge to update the canonical DB.
+    _, diff_output, _ = _git(
+        ["diff", "--name-only", "HEAD~1", "HEAD"],
+        cwd=main_root,
+    )
+    project_root = main_root
+    indexed = 0
+    for rel_path in diff_output.splitlines():
+        if not rel_path.endswith(".py"):
+            continue
+        abs_path = str(Path(main_root) / rel_path)
+        if Path(abs_path).is_file():
+            try:
+                update_file(abs_path, project_root, conn)
+                indexed += 1
+            except Exception:
+                pass
+
+    # Update base_commit in DB to reflect the new merge HEAD.
+    _, new_head, _ = _git(["rev-parse", "HEAD"], cwd=main_root)
+    with conn:
+        conn.execute(
+            "UPDATE worktrees SET base_commit = ? WHERE worktree_path = ?",
+            (new_head, worktree_path),
+        )
+
+    print(
+        f"worktree-push: merged '{branch_name}' → main, re-indexed {indexed} file(s)",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+
+def handle_worktree_pull(payload: dict, conn: sqlite3.Connection) -> None:
+    """
+    Rebase an agent's worktree branch onto the latest main so the agent's view
+    is current before resuming work.
+
+    Payload:
+        worktree_path  — path to the agent's worktree
+        agent_id       — agent identifier
+
+    Invoke via:
+        echo '{"agent_id": "agent-1", "worktree_path": "/tmp/wt-agent-1"}' \\
+            | python coordinator.py --worktree-pull
+    """
+    worktree_path = payload.get("worktree_path", "")
+    if not worktree_path:
+        print("worktree-pull: worktree_path required", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        main_root = _main_repo_root(worktree_path)
+    except Exception:
+        print("worktree-pull: could not resolve main repo root", file=sys.stderr)
+        sys.exit(1)
+
+    # Rebase the agent's branch onto the current main HEAD.
+    rc, _, err = _git(["rebase", "main"], cwd=worktree_path)
+    if rc != 0:
+        print(
+            f"worktree-pull: rebase failed — {err}. "
+            "Resolve conflicts, then run 'git rebase --continue' in the worktree.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    _, new_base, _ = _git(["rev-parse", "HEAD"], cwd=worktree_path)
+    with conn:
+        conn.execute(
+            "UPDATE worktrees SET base_commit = ? WHERE worktree_path = ?",
+            (new_base, worktree_path),
+        )
+
+    print(f"worktree-pull: rebased onto main (new HEAD {new_base[:8]})", file=sys.stderr)
     sys.exit(0)
 
 
 def handle_worktree_remove(payload: dict, conn: sqlite3.Connection) -> None:
+    """
+    Remove an agent's worktree and its branch, release all held locks.
+
+    Payload:
+        worktree_path  — path to the agent's worktree
+        delete_branch  — if true (default), delete the agent branch after removal
+
+    Invoke via:
+        echo '{"worktree_path": "/tmp/wt-agent-1"}' \\
+            | python coordinator.py --worktree-remove
+    """
     worktree_path = payload.get("worktree_path", "")
+    delete_branch = payload.get("delete_branch", True)
     if not worktree_path:
         sys.exit(0)
-    rows = conn.execute(
-        "SELECT agent_id FROM worktrees WHERE worktree_path = ?", (worktree_path,)
-    ).fetchall()
-    for (agent_id,) in rows:
+
+    row = conn.execute(
+        "SELECT agent_id, branch_name FROM worktrees WHERE worktree_path = ?",
+        (worktree_path,),
+    ).fetchone()
+
+    if row:
+        agent_id, branch_name = row
         _release_agent_locks(agent_id, conn)
+    else:
+        branch_name = None
+
+    try:
+        main_root = _main_repo_root(worktree_path)
+    except Exception:
+        main_root = None
+
+    if main_root:
+        _git(["worktree", "remove", "--force", worktree_path], cwd=main_root)
+        if delete_branch and branch_name:
+            _git(["branch", "-d", branch_name], cwd=main_root)
+
     with conn:
         conn.execute("DELETE FROM worktrees WHERE worktree_path = ?", (worktree_path,))
+
+    print(f"worktree-remove: removed '{worktree_path}'", file=sys.stderr)
     sys.exit(0)
 
 
@@ -1039,6 +1333,8 @@ def main() -> None:
     elif "--cwd-changed"     in args: mode = "cwd_changed"
     elif "--crawl-project"   in args: mode = "crawl_project"
     elif "--worktree-create" in args: mode = "worktree_create"
+    elif "--worktree-push"   in args: mode = "worktree_push"
+    elif "--worktree-pull"   in args: mode = "worktree_pull"
     elif "--worktree-remove" in args: mode = "worktree_remove"
     elif "--post-tool-batch" in args: mode = "post_tool_batch"
     elif "--pre-compact"     in args: mode = "pre_compact"
@@ -1090,6 +1386,10 @@ def main() -> None:
         handle_crawl_project(payload, conn)
     elif mode == "worktree_create":
         handle_worktree_create(payload, conn)
+    elif mode == "worktree_push":
+        handle_worktree_push(payload, conn)
+    elif mode == "worktree_pull":
+        handle_worktree_pull(payload, conn)
     elif mode == "worktree_remove":
         handle_worktree_remove(payload, conn)
     elif mode == "post_tool_batch":
