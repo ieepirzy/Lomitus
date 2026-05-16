@@ -25,6 +25,13 @@ def list_users() -> List[User]:
     return list(_users.values())
 
 
+def delete_user(user_id: int) -> bool:
+    if user_id in _users:
+        del _users[user_id]
+        return True
+    return False
+
+
 def create_item(name: str, owner_id: int, description: str = "") -> Item:
     global _next_item_id
     item = Item(id=_next_item_id, name=name, owner_id=owner_id, description=description)
