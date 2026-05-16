@@ -10,6 +10,7 @@ class User:
     username: str
     email: str
     is_active: bool = True
+    role: str = "member"
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 
