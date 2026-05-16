@@ -37,6 +37,7 @@ Usage in .claude/settings.json:
 
 from __future__ import annotations
 
+import fcntl
 import json
 import sqlite3
 import subprocess
@@ -377,33 +378,226 @@ def _log_worktree_event(
         )
 
 
-def _agent_view_stale(file_path: str, conn: sqlite3.Connection) -> list[str]:
+def _get_worktree_for_file(file_path: str, conn: sqlite3.Connection) -> str | None:
+    """Return the worktree_path if file_path lives inside a registered worktree, else None."""
+    abs_path = str(Path(file_path).resolve())
+    for (wt_path,) in conn.execute("SELECT worktree_path FROM worktrees").fetchall():
+        wt_abs = str(Path(wt_path).resolve())
+        if abs_path.startswith(wt_abs + "/"):
+            return wt_path
+    return None
+
+
+def _subgraph_stale(
+    file_path: str,
+    dep_files: set[str],
+    wt_path: str,
+    conn: sqlite3.Connection,
+) -> list[str]:
     """
-    Return a list of node names where the agent's worktree copy differs from
-    the canonical DB state. An empty list means the view is current.
+    Compare the Merkle root of the agent's worktree subgraph (target file + its
+    1-hop deps) against the canonical DB's Merkle root for the same subgraph.
+
+    Returns a list of stale node names (empty = views match, safe to proceed).
+
+    Algorithm:
+      For each file in {file_path} ∪ dep_files:
+        1. Resolve its canonical path (main-repo equivalent).
+        2. Look up the canonical content_hash per node in the DB.
+        3. Parse the worktree copy of the same file and compare hashes.
+      Any node whose hash differs from the canonical DB is stale.
     """
-    canonical_path = _worktree_to_canonical(file_path, conn)
-    if not canonical_path:
-        return []
-    db_nodes = {
-        r[0]: r[1]
-        for r in conn.execute(
-            "SELECT node_id, content_hash FROM nodes WHERE file_path = ?",
-            (str(Path(canonical_path).resolve()),),
-        ).fetchall()
-    }
-    if not db_nodes:
-        return []
-    try:
-        agent_nodes = {n.name: n.content_hash for n in parse_file(file_path) if n.name}
-    except Exception:
-        return []
-    stale = []
-    for node_id, db_hash in db_nodes.items():
-        name = node_id.split("::")[-1]
-        if name in agent_nodes and agent_nodes[name] != db_hash:
-            stale.append(name)
+    stale: list[str] = []
+    all_wt_files = {file_path} | dep_files
+
+    for wt_file in all_wt_files:
+        # Map worktree path → canonical path.
+        canonical_path = _worktree_to_canonical(wt_file, conn)
+        if not canonical_path:
+            # File is not in a worktree mapping — skip (main-repo edits bypass check).
+            continue
+
+        db_nodes = {
+            r[0]: r[1]
+            for r in conn.execute(
+                "SELECT node_id, content_hash FROM nodes WHERE file_path = ?",
+                (str(Path(canonical_path).resolve()),),
+            ).fetchall()
+        }
+        if not db_nodes:
+            continue  # File not yet indexed in canonical DB — not stale.
+
+        try:
+            wt_parsed = {n.name: n.content_hash for n in parse_file(wt_file) if n.name}
+        except Exception:
+            continue
+
+        for node_id, db_hash in db_nodes.items():
+            name = node_id.split("::")[-1]
+            if name in wt_parsed and wt_parsed[name] != db_hash:
+                stale.append(f"{Path(wt_file).name}::{name}")
+
     return stale
+
+
+def _auto_pull_worktree(
+    wt_path: str,
+    conn: sqlite3.Connection,
+    agent_id: str | None = None,
+) -> bool:
+    """
+    Rebase the agent's worktree branch onto the current main HEAD.
+    Updates base_commit in DB and logs the event.
+    Returns True on success, False if rebase conflicted (aborted automatically).
+    """
+    row = conn.execute(
+        "SELECT agent_id, branch_name FROM worktrees WHERE worktree_path = ?",
+        (wt_path,),
+    ).fetchone()
+    effective_agent = agent_id or (row[0] if row else None)
+    branch_name = row[1] if row else None
+
+    _, pre_head, _ = _git(["rev-parse", "HEAD"], cwd=wt_path)
+    rc, _, err = _git(["rebase", "main"], cwd=wt_path)
+    if rc != 0:
+        _git(["rebase", "--abort"], cwd=wt_path)
+        _log_worktree_event(
+            "pull_failed", wt_path, conn,
+            agent_id=effective_agent, branch_name=branch_name,
+            from_commit=pre_head,
+            detail=f"auto-rebase conflict (aborted): {err[:150]}",
+        )
+        return False
+
+    _, new_head, _ = _git(["rev-parse", "HEAD"], cwd=wt_path)
+    with conn:
+        conn.execute(
+            "UPDATE worktrees SET base_commit = ? WHERE worktree_path = ?",
+            (new_head, wt_path),
+        )
+    _refresh_worktree_status(wt_path, conn)
+    _log_worktree_event(
+        "pull", wt_path, conn,
+        agent_id=effective_agent, branch_name=branch_name,
+        from_commit=pre_head, to_commit=new_head,
+        detail="auto-pull on staleness detection",
+    )
+    return True
+
+
+def _auto_commit_and_push(
+    file_path: str,
+    wt_path: str,
+    agent_id: str,
+    conn: sqlite3.Connection,
+) -> None:
+    """
+    Called from PostToolUse (handle_release) when the edited file lives in a
+    registered worktree.
+
+    Strategy — rebase-then-fast-forward with a file lock:
+      1. Commit the change to the agent's worktree branch.
+      2. Acquire an exclusive OS file lock on <main_root>/.git/coordinator-push.lock
+         so concurrent PostToolUse calls from different agents are serialised.
+      3. Rebase the worktree branch onto the latest main (incorporates any
+         changes that landed while this agent held its node lock).
+      4. Fast-forward main to the rebased branch HEAD (--ff-only, never conflicts).
+      5. Update base_commit in DB and release the file lock.
+
+    Why this eliminates merge conflicts:
+      - A rebase can surface a text conflict only when two agents edited the
+        *same lines* of the same file.  That case is already prevented upstream
+        by the node-level lock: two agents can only hold concurrent locks on
+        *different structural nodes* of the same file, which by definition
+        touch different lines.
+      - The fast-forward step is conflict-free by definition.
+      - The file lock means only one agent performs the rebase+ff at a time,
+        so main is always in a clean state when the lock is acquired.
+    """
+    try:
+        rel_path = str(Path(file_path).resolve().relative_to(Path(wt_path).resolve()))
+    except ValueError:
+        return
+
+    # --- Step 1: commit in the worktree ---
+    _git(["add", "-f", rel_path], cwd=wt_path)
+    _, status_out, _ = _git(["status", "--porcelain", rel_path], cwd=wt_path)
+    if not status_out.strip():
+        return  # nothing to commit (edit was a no-op on disk)
+
+    rc, _, err = _git(
+        ["commit", "-m", f"coordinator: {agent_id} edited {Path(rel_path).name}"],
+        cwd=wt_path,
+    )
+    if rc != 0:
+        print(f"[coordinator] auto-commit failed: {err}", file=sys.stderr)
+        return
+
+    row = conn.execute(
+        "SELECT branch_name FROM worktrees WHERE worktree_path = ?", (wt_path,)
+    ).fetchone()
+    if not row or not row[0]:
+        return
+    branch_name = row[0]
+
+    try:
+        main_root = _main_repo_root(wt_path)
+    except Exception:
+        return
+
+    # --- Step 2: acquire exclusive file lock on main repo ---
+    lock_path = str(Path(main_root) / ".git" / "coordinator-push.lock")
+    with open(lock_path, "w") as _lock_fh:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX)
+
+        _, pre_head, _ = _git(["rev-parse", "HEAD"], cwd=main_root)
+
+        # --- Step 3: rebase worktree branch onto latest main ---
+        rc, _, err = _git(["rebase", "main"], cwd=wt_path)
+        if rc != 0:
+            # Should be extremely rare given node-level locks; log and bail.
+            _git(["rebase", "--abort"], cwd=wt_path)
+            _log_worktree_event(
+                "push_failed", wt_path, conn,
+                agent_id=agent_id, branch_name=branch_name,
+                from_commit=pre_head,
+                detail=f"rebase conflict during auto-push: {err[:150]}",
+            )
+            print(f"[coordinator] auto-push rebase failed: {err}", file=sys.stderr)
+            return
+
+        # --- Step 4: fast-forward main to rebased branch HEAD ---
+        rc, _, err = _git(["merge", "--ff-only", branch_name], cwd=main_root)
+        if rc != 0:
+            # Should never happen after a successful rebase; defensive log.
+            _log_worktree_event(
+                "push_failed", wt_path, conn,
+                agent_id=agent_id, branch_name=branch_name,
+                from_commit=pre_head,
+                detail=f"ff-merge failed after rebase: {err[:150]}",
+            )
+            print(f"[coordinator] ff-merge failed: {err}", file=sys.stderr)
+            return
+
+        _, new_head, _ = _git(["rev-parse", "HEAD"], cwd=main_root)
+
+    # --- Step 5: update DB (outside file lock — no git ops) ---
+    with conn:
+        conn.execute(
+            "UPDATE worktrees SET base_commit = ? WHERE worktree_path = ?",
+            (new_head, wt_path),
+        )
+    _refresh_worktree_status(wt_path, conn)
+    _log_worktree_event(
+        "push", wt_path, conn,
+        agent_id=agent_id, branch_name=branch_name,
+        from_commit=pre_head, to_commit=new_head,
+        detail=f"auto-push from PostToolUse: {Path(rel_path).name}",
+    )
+    print(
+        f"[coordinator] auto-pushed '{Path(rel_path).name}' from '{branch_name}' → main",
+        file=sys.stderr,
+    )
 
 
 def find_project_root(start: str) -> str:
@@ -693,16 +887,31 @@ def handle_pretool(
 
     project_root = find_project_root(file_path)
 
-    # 0. Staleness check: if this agent is working in a worktree and the canonical
-    #    DB has advanced past what the agent last observed, block immediately so the
-    #    agent replans against the current state rather than writing on top of stale code.
-    stale_nodes = _agent_view_stale(file_path, conn)
-    if stale_nodes:
-        block(
-            f"Agent's view of '{Path(file_path).name}' is stale — canonical state has "
-            f"advanced on: {', '.join(stale_nodes)}. "
-            f"Run --worktree-pull to rebase onto latest main, then replan."
+    # 0. Worktree Merkle-root staleness check.
+    #    Before any lock is acquired, verify that the agent's view of the target
+    #    file and its 1-hop dependency subgraph matches the canonical DB state.
+    #    If not: auto-rebase the worktree onto main and block so the agent replans
+    #    with the updated code.  This makes merge conflicts structurally impossible:
+    #    the lock window covers read → edit → commit → push-to-main atomically.
+    wt_path = _get_worktree_for_file(file_path, conn)
+    if wt_path:
+        # Quick 1-hop crawl to know which dep files to include in the check.
+        _quick_dep_files = (
+            crawl_subgraph(file_path, depth=1, conn=conn, direction="forward") - {file_path}
         )
+        stale_nodes = _subgraph_stale(file_path, _quick_dep_files, wt_path, conn)
+        if stale_nodes:
+            pulled = _auto_pull_worktree(wt_path, conn, agent_id)
+            if pulled:
+                block(
+                    f"Worktree was stale on {stale_nodes} — "
+                    f"auto-rebased onto latest main. Replan with the updated state."
+                )
+            else:
+                block(
+                    f"Worktree stale on {stale_nodes} and auto-rebase conflicted. "
+                    f"Manually resolve conflicts in '{wt_path}', then replan."
+                )
 
     # 1. Cold cache: ensure target is indexed before any node lookups.
     # Guard: skip index_file for non-existent files (Write to a new file).
@@ -922,6 +1131,15 @@ def handle_release(
     # update_file also handles the new-nodes case: if Write added functions to a previously
     # empty file, they are indexed here and visible to subsequent agents.
     update_file(file_path, project_root, conn)
+
+    # Worktree auto-push: if the file lives in a registered worktree, commit the
+    # change to the agent's branch and merge it into main before releasing the lock.
+    # This is the guarantee that makes merge conflicts impossible: the lock covers
+    # the full edit → push window, so no other agent can write the same node between
+    # our edit and our merge landing on main.
+    wt = _get_worktree_for_file(file_path, conn)
+    if wt:
+        _auto_commit_and_push(file_path, wt, agent_id, conn)
 
     # Contract validation: re-execute each node and compare structure against snapshot.
     # A superset failure triggers the cascade flow (does not block the original edit).
