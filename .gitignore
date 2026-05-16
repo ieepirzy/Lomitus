@@ -12,7 +12,6 @@ __pycache__/
 *.so
 
 test-codebase/
-greenfield/
 
 # Distribution / packaging
 .Python
