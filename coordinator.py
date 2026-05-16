@@ -125,10 +125,27 @@ CREATE TABLE IF NOT EXISTS lock_queue (
     UNIQUE(node_id, agent_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_locks_file ON locks(file_path);
-CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
-CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file);
-CREATE INDEX IF NOT EXISTS idx_edges_to   ON edges(to_file);
+CREATE TABLE IF NOT EXISTS agent_traversal_nodes (
+    agent_id   TEXT NOT NULL,
+    node_id    TEXT NOT NULL,
+    visited_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (agent_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_traversal_edges (
+    agent_id     TEXT NOT NULL,
+    from_file    TEXT NOT NULL,
+    to_file      TEXT NOT NULL,
+    traversed_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (agent_id, from_file, to_file)
+);
+
+CREATE INDEX IF NOT EXISTS idx_locks_file      ON locks(file_path);
+CREATE INDEX IF NOT EXISTS idx_nodes_file      ON nodes(file_path);
+CREATE INDEX IF NOT EXISTS idx_edges_from      ON edges(from_file);
+CREATE INDEX IF NOT EXISTS idx_edges_to        ON edges(to_file);
+CREATE INDEX IF NOT EXISTS idx_trav_nodes_agent ON agent_traversal_nodes(agent_id);
+CREATE INDEX IF NOT EXISTS idx_trav_edges_agent ON agent_traversal_edges(agent_id);
 """
 
 
@@ -404,6 +421,37 @@ def _cascade_mark_complete(node_id: str, agent_id: str, conn: sqlite3.Connection
 
 
 # ---------------------------------------------------------------------------
+# Agent traversal recording
+# ---------------------------------------------------------------------------
+
+def _record_traversal(
+    agent_id: str,
+    node_ids: list[str],
+    from_file: str,
+    dep_files: set[str],
+    conn: sqlite3.Connection,
+) -> None:
+    """
+    Append touched nodes and traversed edges to the agent's traversal subgraph.
+    node_ids: structural/external nodes the agent targeted in from_file.
+    dep_files: files reached by the 1-hop forward crawl from from_file.
+    Edges stored are the actual import edges the coordinator followed.
+    """
+    with conn:
+        if node_ids:
+            conn.executemany(
+                "INSERT OR IGNORE INTO agent_traversal_nodes (agent_id, node_id) VALUES (?, ?)",
+                [(agent_id, nid) for nid in node_ids],
+            )
+        for dep in dep_files:
+            conn.execute(
+                "INSERT OR IGNORE INTO agent_traversal_edges (agent_id, from_file, to_file) "
+                "VALUES (?, ?, ?)",
+                (agent_id, from_file, dep),
+            )
+
+
+# ---------------------------------------------------------------------------
 # PreToolUse
 # ---------------------------------------------------------------------------
 
@@ -465,6 +513,9 @@ def handle_pretool(
     for dep in dep_files:
         if not is_indexed(dep, conn):
             index_file(dep, project_root, conn)
+
+    # Record this agent's traversal: nodes targeted + edges followed.
+    _record_traversal(agent_id, structural_targets, file_path, dep_files, conn)
 
     # 4. Conflict check — bloom pre-filter then SQLite confirm.
     #    Collect all conflicts before blocking so the agent gets the full picture.
