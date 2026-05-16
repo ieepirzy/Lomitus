@@ -5,9 +5,10 @@ coordinator.py — multi-agent subgraph lock coordinator, v1.
 Reads hook context from stdin (JSON). Exits 0 (allow) or 2 (block).
 
 Flags:
-  (none)     PreToolUse         — conflict check, lock acquisition, subgraph snapshot
-  --release  PostToolUse        — drift check, global cache update, lock release
-  --failure  PostToolUseFailure — silent lock release, no cache update
+  (none)            PreToolUse         — conflict check, lock acquisition, subgraph snapshot
+  --release         PostToolUse        — drift check, global cache update, lock release
+  --failure         PostToolUseFailure — silent lock release, no cache update
+  --crawl-project   manual / session-start — recursively index all .py files in project root
 
 Usage in .claude/settings.json:
 {
@@ -159,6 +160,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _is_python(file_path: str) -> bool:
+    return Path(file_path).suffix == ".py"
+
 
 def find_project_root(start: str) -> str:
     p = Path(start).resolve()
@@ -410,6 +415,10 @@ def handle_pretool(
     tool_input: dict,
     conn: sqlite3.Connection,
 ) -> None:
+    # Non-Python files have no AST graph — no conflict detection possible.
+    if not _is_python(file_path):
+        allow()
+
     project_root = find_project_root(file_path)
 
     # 1. Cold cache: ensure target is indexed before any node lookups.
@@ -802,7 +811,7 @@ def _warm_from_file(file_path: str, depth: int, project_root: str, conn: sqlite3
     """Re-index file_path if stale, then warm depth edges forward.
     Skips re-indexing when hashes already match — guards against double-indexing
     when PostToolUse runs before a FileChanged event fires for the same edit."""
-    if not Path(file_path).is_file():
+    if not Path(file_path).is_file() or not _is_python(file_path):
         return
     if not is_fresh(file_path, conn):
         update_file(file_path, project_root, conn)
@@ -887,6 +896,44 @@ def handle_cwd_changed(payload: dict, conn: sqlite3.Connection) -> None:
     sys.exit(0)
 
 
+def handle_crawl_project(payload: dict, conn: sqlite3.Connection) -> None:
+    """
+    Walk the project root recursively and index every .py file.
+    Skips files that are already fresh. Ideal for small codebases where
+    warming the full graph once at session start is faster than lazy per-file indexing.
+
+    Invoke via:
+        echo '{"session_id": "..."}' | python coordinator.py --crawl-project
+    """
+    cwd = payload.get("cwd", "") or str(Path.cwd())
+    project_root = find_project_root(cwd)
+    _SKIP_DIRS = frozenset({
+        ".venv", "venv", ".env", "env", "site-packages",
+        "__pycache__", ".git", "node_modules", ".tox", "build", "dist",
+    })
+
+    root_path = Path(project_root)
+    indexed = skipped = errors = 0
+    for py_file in sorted(root_path.rglob("*.py")):
+        if any(part in _SKIP_DIRS for part in py_file.parts):
+            continue
+        abs_path = str(py_file.resolve())
+        try:
+            if is_fresh(abs_path, conn):
+                skipped += 1
+            else:
+                index_file(abs_path, project_root, conn)
+                indexed += 1
+        except Exception:
+            errors += 1
+    print(
+        f"crawl-project: {indexed} indexed, {skipped} fresh (skipped), {errors} errors "
+        f"in '{project_root}'",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+
 def handle_worktree_create(payload: dict, conn: sqlite3.Connection) -> None:
     worktree_path = payload.get("worktree_path", "")
     if not worktree_path:
@@ -939,6 +986,7 @@ def main() -> None:
     elif "--subagent-stop"   in args: mode = "subagent_stop"
     elif "--file-changed"    in args: mode = "file_changed"
     elif "--cwd-changed"     in args: mode = "cwd_changed"
+    elif "--crawl-project"   in args: mode = "crawl_project"
     elif "--worktree-create" in args: mode = "worktree_create"
     elif "--worktree-remove" in args: mode = "worktree_remove"
     elif "--post-tool-batch" in args: mode = "post_tool_batch"
@@ -987,6 +1035,8 @@ def main() -> None:
         handle_file_changed(payload, conn)
     elif mode == "cwd_changed":
         handle_cwd_changed(payload, conn)
+    elif mode == "crawl_project":
+        handle_crawl_project(payload, conn)
     elif mode == "worktree_create":
         handle_worktree_create(payload, conn)
     elif mode == "worktree_remove":
