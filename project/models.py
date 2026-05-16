@@ -19,4 +19,5 @@ class Item:
     name: str
     owner_id: int
     description: str = ""
+    tags: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.utcnow)
