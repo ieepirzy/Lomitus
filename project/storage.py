@@ -32,9 +32,9 @@ def delete_user(user_id: int) -> bool:
     return False
 
 
-def create_item(name: str, owner_id: int, description: str = "", tags: Optional[List[str]] = None) -> Item:
+def create_item(name: str, owner_id: int, description: str = "", tags: Optional[List[str]] = None, price: float = 0.0) -> Item:
     global _next_item_id
-    item = Item(id=_next_item_id, name=name, owner_id=owner_id, description=description, tags=tags if tags is not None else [])
+    item = Item(id=_next_item_id, name=name, owner_id=owner_id, description=description, tags=tags if tags is not None else [], price=price)
     _items[item.id] = item
     _next_item_id += 1
     return item
