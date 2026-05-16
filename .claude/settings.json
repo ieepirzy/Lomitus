@@ -1,11 +1,44 @@
 {
   "permissions": {
     "allow": [
+      "Read",
       "Write",
-      "Edit"
+      "Edit",
+      "Bash"
     ]
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --session-start"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --session-end"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --pre-compact"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",
@@ -24,6 +57,17 @@
           {
             "type": "command",
             "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --release"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --failure"
           }
         ]
       }

@@ -38,6 +38,7 @@ Usage in .claude/settings.json:
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -169,6 +170,13 @@ CREATE TABLE IF NOT EXISTS agent_traversal_edges (
     to_file      TEXT NOT NULL,
     traversed_at TEXT DEFAULT (datetime('now')),
     PRIMARY KEY (agent_id, from_file, to_file)
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id    TEXT PRIMARY KEY,
+    pre_head      TEXT,
+    project_root  TEXT,
+    started_at    TEXT DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_locks_file      ON locks(file_path);
@@ -388,6 +396,53 @@ def _get_worktree_for_file(file_path: str, conn: sqlite3.Connection) -> str | No
     return None
 
 
+def _expire_stale_locks(conn: sqlite3.Connection) -> None:
+    """
+    Scan for locks past their TTL, revert files from snapshots where available,
+    and release the locks. Prevents crashed agents from permanently blocking nodes.
+    Called at the start of each PreToolUse.
+    """
+    expired = conn.execute(
+        "SELECT node_id, file_path, agent_id FROM locks "
+        "WHERE expires_at IS NOT NULL AND expires_at < datetime('now')"
+    ).fetchall()
+
+    if not expired:
+        return
+
+    reverted_files: set[str] = set()
+    bloom = load_bloom(conn)
+
+    for node_id, file_path, agent_id in expired:
+        if file_path not in reverted_files:
+            snap = conn.execute(
+                "SELECT source_content FROM snapshots WHERE node_id = ?", (node_id,)
+            ).fetchone()
+            if snap and snap[0]:
+                try:
+                    Path(file_path).write_text(snap[0], encoding="utf-8")
+                    reverted_files.add(file_path)
+                    update_file(file_path, find_project_root(file_path), conn)
+                    print(
+                        f"[coordinator] TTL expired: reverted '{Path(file_path).name}' "
+                        f"(was held by '{agent_id}')",
+                        file=sys.stderr,
+                    )
+                except OSError as e:
+                    print(f"[coordinator] TTL revert failed for '{file_path}': {e}", file=sys.stderr)
+
+        conn.execute("DELETE FROM locks WHERE node_id = ?", (node_id,))
+        bloom.remove(node_id)
+
+    conn.commit()
+    save_bloom(conn, bloom)
+    print(
+        f"[coordinator] TTL: released {len(expired)} expired lock(s), "
+        f"reverted {len(reverted_files)} file(s)",
+        file=sys.stderr,
+    )
+
+
 def _subgraph_stale(
     file_path: str,
     dep_files: set[str],
@@ -395,45 +450,77 @@ def _subgraph_stale(
     conn: sqlite3.Connection,
 ) -> list[str]:
     """
-    Compare the Merkle root of the agent's worktree subgraph (target file + its
-    1-hop deps) against the canonical DB's Merkle root for the same subgraph.
+    Compare the agent's worktree subgraph against the canonical DB using a
+    two-phase approach:
+
+    Fast path  — compute a combined hash of all canonical node hashes from the
+                 DB and a combined hash of all worktree node hashes in one pass.
+                 If they match, the subgraphs are identical: return [] immediately
+                 without per-node SQLite queries.
+
+    Slow path  — if the combined hashes differ, walk the already-loaded data to
+                 identify which specific nodes are stale.
 
     Returns a list of stale node names (empty = views match, safe to proceed).
-
-    Algorithm:
-      For each file in {file_path} ∪ dep_files:
-        1. Resolve its canonical path (main-repo equivalent).
-        2. Look up the canonical content_hash per node in the DB.
-        3. Parse the worktree copy of the same file and compare hashes.
-      Any node whose hash differs from the canonical DB is stale.
     """
-    stale: list[str] = []
     all_wt_files = {file_path} | dep_files
 
+    # --- single-pass data collection ---
+    # wt_to_canonical: worktree path → canonical abs path
+    # canonical_db:    canonical abs path → {node_name: db_hash}
+    wt_to_canonical: dict[str, str] = {}
+    canonical_db: dict[str, dict[str, str]] = {}
+
     for wt_file in all_wt_files:
-        # Map worktree path → canonical path.
         canonical_path = _worktree_to_canonical(wt_file, conn)
         if not canonical_path:
-            # File is not in a worktree mapping — skip (main-repo edits bypass check).
             continue
+        can_abs = str(Path(canonical_path).resolve())
+        wt_to_canonical[wt_file] = can_abs
+        db_rows = conn.execute(
+            "SELECT node_id, content_hash FROM nodes WHERE file_path = ?",
+            (can_abs,),
+        ).fetchall()
+        if db_rows:
+            canonical_db[can_abs] = {r[0].split("::")[-1]: r[1] for r in db_rows}
 
-        db_nodes = {
-            r[0]: r[1]
-            for r in conn.execute(
-                "SELECT node_id, content_hash FROM nodes WHERE file_path = ?",
-                (str(Path(canonical_path).resolve()),),
-            ).fetchall()
-        }
-        if not db_nodes:
-            continue  # File not yet indexed in canonical DB — not stale.
+    if not canonical_db:
+        return []  # nothing indexed in canonical DB yet — not stale
 
+    # Parse worktree files once; cache results for slow path.
+    wt_parsed_cache: dict[str, dict[str, str]] = {}
+    for wt_file in wt_to_canonical:
         try:
-            wt_parsed = {n.name: n.content_hash for n in parse_file(wt_file) if n.name}
+            wt_parsed_cache[wt_file] = {
+                n.name: n.content_hash for n in parse_file(wt_file) if n.name
+            }
         except Exception:
-            continue
+            wt_parsed_cache[wt_file] = {}
 
-        for node_id, db_hash in db_nodes.items():
-            name = node_id.split("::")[-1]
+    # --- fast path: compare combined hashes ---
+    db_tokens = sorted(
+        f"{name}:{h}"
+        for nodes in canonical_db.values()
+        for name, h in nodes.items()
+    )
+    wt_tokens = sorted(
+        f"{name}:{h}"
+        for wt_file, parsed in wt_parsed_cache.items()
+        if wt_file in wt_to_canonical
+        for name, h in parsed.items()
+    )
+    if (
+        hashlib.sha256("|".join(db_tokens).encode()).hexdigest()
+        == hashlib.sha256("|".join(wt_tokens).encode()).hexdigest()
+    ):
+        return []  # fast path: subgraphs match
+
+    # --- slow path: find which nodes are stale ---
+    stale: list[str] = []
+    for wt_file, can_abs in wt_to_canonical.items():
+        db_nodes = canonical_db.get(can_abs, {})
+        wt_parsed = wt_parsed_cache.get(wt_file, {})
+        for name, db_hash in db_nodes.items():
             if name in wt_parsed and wt_parsed[name] != db_hash:
                 stale.append(f"{Path(wt_file).name}::{name}")
 
@@ -887,11 +974,14 @@ def handle_pretool(
 
     project_root = find_project_root(file_path)
 
-    # 0. Worktree Merkle-root staleness check.
+    # 0a. Evict any locks whose TTL has expired (crashed agent recovery).
+    _expire_stale_locks(conn)
+
+    # 0b. Worktree Merkle-root staleness check.
     #    Before any lock is acquired, verify that the agent's view of the target
     #    file and its 1-hop dependency subgraph matches the canonical DB state.
     #    If not: auto-rebase the worktree onto main and block so the agent replans
-    #    with the updated code.  This makes merge conflicts structurally impossible:
+    #    with the updated code. This makes merge conflicts structurally impossible:
     #    the lock window covers read → edit → commit → push-to-main atomically.
     wt_path = _get_worktree_for_file(file_path, conn)
     if wt_path:
@@ -1336,12 +1426,62 @@ def _warm_from_file(file_path: str, depth: int, project_root: str, conn: sqlite3
 # Passive hook handlers
 # ---------------------------------------------------------------------------
 
-def handle_session_start(_payload: dict, _conn: sqlite3.Connection) -> None:
-    # DB is already initialized by get_db().
+def handle_session_start(payload: dict, conn: sqlite3.Connection) -> None:
+    session_id   = payload.get("session_id", "unknown")
+    project_root = str(Path.cwd())
+    _, pre_head, _ = _git(["rev-parse", "HEAD"], cwd=project_root)
+    if pre_head:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions (session_id, pre_head, project_root) "
+                "VALUES (?, ?, ?)",
+                (session_id, pre_head, project_root),
+            )
+        print(
+            f"[coordinator] session '{session_id[:8]}' started "
+            f"(main HEAD: {pre_head[:8]})",
+            file=sys.stderr,
+        )
     sys.exit(0)
 
 
 def handle_session_end(session_id: str, conn: sqlite3.Connection) -> None:
+    # Squash coordinator micro-commits into one clean commit on main —
+    # but only if no agent locks are currently held (i.e. it's a true session end,
+    # not a mid-session /compact). If agents are still active, skip the squash so
+    # we don't destroy in-flight work.
+    #
+    # NOTE: git reset --soft rewrites local history. This is safe because the
+    # workflow is local-only: changes are pushed to the remote (GitHub) manually
+    # at chosen checkpoints, never automatically during a session. If you ever
+    # add automated remote pushes mid-session, the squash will diverge from
+    # what's already on the remote and require a force-push.
+    active_locks = conn.execute("SELECT COUNT(*) FROM locks").fetchone()[0]
+    if active_locks == 0:
+        sess = conn.execute(
+            "SELECT pre_head, project_root FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if sess and sess[0] and sess[1]:
+            pre_head, project_root = sess[0], sess[1]
+            _, count_str, _ = _git(
+                ["rev-list", "--count", f"{pre_head}..HEAD"], cwd=project_root
+            )
+            count = int(count_str.strip()) if count_str.strip().isdigit() else 0
+            if count > 1:
+                _git(["reset", "--soft", pre_head], cwd=project_root)
+                _git(
+                    ["commit", "-m",
+                     f"coordinator: session {session_id[:8]} — {count} agent edits"],
+                    cwd=project_root,
+                )
+                print(
+                    f"[coordinator] squashed {count} micro-commits → 1 on main",
+                    file=sys.stderr,
+                )
+        with conn:
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+
     locked = conn.execute("SELECT node_id FROM locks").fetchall()
     conn.execute("DELETE FROM locks")
     conn.execute("DELETE FROM agents WHERE session_id = ?", (session_id,))
@@ -1813,8 +1953,41 @@ def handle_worktree_remove(payload: dict, conn: sqlite3.Connection) -> None:
     sys.exit(0)
 
 
-def handle_post_tool_batch(_conn: sqlite3.Connection) -> None:
-    # v1 no-op: batch-level validation is a v2 concern.
+def handle_post_tool_batch(payload: dict, conn: sqlite3.Connection) -> None:
+    """
+    Fires after a parallel batch of tool calls resolves, before the next model call.
+    Re-validates the Merkle root of every subgraph snapshot held by this agent.
+    If any dependency shifted during the batch window, block and report drift so
+    the agent replans against the current state.
+    """
+    agent_id = payload.get("agent_id") or payload.get("session_id", "unknown")
+
+    rows = conn.execute(
+        "SELECT node_id, file_path, subgraph_hash, subgraph_nodes FROM locks "
+        "WHERE agent_id = ? AND subgraph_hash IS NOT NULL",
+        (agent_id,),
+    ).fetchall()
+
+    drift_nodes: list[str] = []
+    for node_id, _file_path, stored_hash, subgraph_nodes_json in rows:
+        if _is_sentinel(node_id):
+            continue
+        stored_nodes = json.loads(subgraph_nodes_json) if subgraph_nodes_json else []
+        if not stored_nodes:
+            continue
+        recomputed = compute_merkle_root_from_node_ids(stored_nodes, conn)
+        if recomputed != stored_hash:
+            drift_nodes.append(node_id.rsplit("::", 1)[-1])
+
+    if drift_nodes:
+        print(
+            f"[coordinator] PostToolBatch: subgraph drift detected on "
+            f"{drift_nodes} for '{agent_id}'. "
+            "A dependency shifted during the batch. Replan against current state.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     sys.exit(0)
 
 
@@ -1905,7 +2078,7 @@ def main() -> None:
     elif mode == "worktree_remove":
         handle_worktree_remove(payload, conn)
     elif mode == "post_tool_batch":
-        handle_post_tool_batch(conn)
+        handle_post_tool_batch(payload, conn)
     elif mode == "pre_compact":
         handle_pre_compact(conn)
 
