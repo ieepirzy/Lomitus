@@ -1529,7 +1529,8 @@ def handle_file_changed(payload: dict, conn: sqlite3.Connection) -> None:
 
 
 def handle_cwd_changed(payload: dict, conn: sqlite3.Connection) -> None:
-    cwd = payload.get("cwd", "")
+    # Real payload field is `new_cwd`; fall back to `cwd` for manual invocations.
+    cwd = payload.get("new_cwd") or payload.get("cwd", "")
     if not cwd:
         sys.exit(0)
     cwd_path = Path(cwd)
@@ -1673,6 +1674,73 @@ def handle_worktree_status(payload: dict, conn: sqlite3.Connection) -> None:
             results.append({"worktree_path": wt_path, "error": str(exc)})
 
     print(json.dumps(results, indent=2), flush=True)
+    sys.exit(0)
+
+
+def handle_worktree_create_hook(payload: dict, conn: sqlite3.Connection) -> None:
+    """
+    Fired automatically by the WorktreeCreate hook when Claude Code creates a
+    worktree. The payload has `name` (worktree name) but NOT the path — we
+    resolve the path by scanning `git worktree list --porcelain` and matching
+    on the directory name or branch name.
+    """
+    name       = payload.get("name", "")
+    agent_id   = payload.get("agent_id") or payload.get("session_id", "unknown")
+    session_id = payload.get("session_id", "")
+
+    if not name:
+        sys.exit(0)
+
+    try:
+        main_root = _main_repo_root(str(Path.cwd()))
+    except Exception:
+        sys.exit(0)
+
+    _, wt_list, _ = _git(["worktree", "list", "--porcelain"], cwd=main_root)
+
+    # Parse porcelain blocks: each block is separated by a blank line.
+    # Fields: "worktree <path>", "HEAD <hash>", "branch refs/heads/<branch>"
+    worktree_path: str | None = None
+    branch_name:   str | None = None
+    current_path:  str | None = None
+    current_branch: str | None = None
+
+    for line in wt_list.splitlines():
+        if line.startswith("worktree "):
+            current_path   = line[len("worktree "):]
+            current_branch = None
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]               # refs/heads/<branch>
+            current_branch = ref.rsplit("/", 1)[-1]
+            # Match if the name equals the branch name or the worktree dir name.
+            if name in (current_branch, Path(current_path).name if current_path else ""):
+                worktree_path = current_path
+                branch_name   = current_branch
+                break
+
+    if not worktree_path or not Path(worktree_path).is_dir():
+        sys.exit(0)
+
+    _, base_commit, _ = _git(["rev-parse", "HEAD"], cwd=worktree_path)
+
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO worktrees "
+            "(worktree_path, agent_id, session_id, branch_name, base_commit) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (worktree_path, agent_id, session_id, branch_name, base_commit),
+        )
+    _refresh_worktree_status(worktree_path, conn)
+    _log_worktree_event(
+        "create", worktree_path, conn,
+        agent_id=agent_id, branch_name=branch_name,
+        to_commit=base_commit,
+        detail=f"auto-registered via WorktreeCreate hook (name={name})",
+    )
+    print(
+        f"[coordinator] WorktreeCreate: registered '{branch_name}' at '{worktree_path}'",
+        file=sys.stderr,
+    )
     sys.exit(0)
 
 
@@ -2003,25 +2071,26 @@ def handle_pre_compact(conn: sqlite3.Connection) -> None:
 def main() -> None:
     args = set(sys.argv[1:])
 
-    if   "--revert"          in args: mode = "revert"
-    elif "--session-start"   in args: mode = "session_start"
-    elif "--session-end"     in args: mode = "session_end"
-    elif "--subagent-start"  in args: mode = "subagent_start"
-    elif "--subagent-stop"   in args: mode = "subagent_stop"
-    elif "--file-changed"    in args: mode = "file_changed"
-    elif "--cwd-changed"     in args: mode = "cwd_changed"
-    elif "--crawl-project"   in args: mode = "crawl_project"
-    elif "--worktree-create" in args: mode = "worktree_create"
-    elif "--worktree-push"   in args: mode = "worktree_push"
-    elif "--worktree-pull"   in args: mode = "worktree_pull"
-    elif "--worktree-status" in args: mode = "worktree_status"
-    elif "--worktree-log"    in args: mode = "worktree_log"
-    elif "--worktree-remove" in args: mode = "worktree_remove"
-    elif "--post-tool-batch" in args: mode = "post_tool_batch"
-    elif "--pre-compact"     in args: mode = "pre_compact"
-    elif "--release"         in args: mode = "release"
-    elif "--failure"         in args: mode = "failure"
-    else:                             mode = "pretool"
+    if   "--revert"               in args: mode = "revert"
+    elif "--session-start"        in args: mode = "session_start"
+    elif "--session-end"          in args: mode = "session_end"
+    elif "--subagent-start"       in args: mode = "subagent_start"
+    elif "--subagent-stop"        in args: mode = "subagent_stop"
+    elif "--file-changed"         in args: mode = "file_changed"
+    elif "--cwd-changed"          in args: mode = "cwd_changed"
+    elif "--crawl-project"        in args: mode = "crawl_project"
+    elif "--worktree-create-hook" in args: mode = "worktree_create_hook"
+    elif "--worktree-create"      in args: mode = "worktree_create"
+    elif "--worktree-push"        in args: mode = "worktree_push"
+    elif "--worktree-pull"        in args: mode = "worktree_pull"
+    elif "--worktree-status"      in args: mode = "worktree_status"
+    elif "--worktree-log"         in args: mode = "worktree_log"
+    elif "--worktree-remove"      in args: mode = "worktree_remove"
+    elif "--post-tool-batch"      in args: mode = "post_tool_batch"
+    elif "--pre-compact"          in args: mode = "pre_compact"
+    elif "--release"              in args: mode = "release"
+    elif "--failure"              in args: mode = "failure"
+    else:                                  mode = "pretool"
 
     try:
         payload = parse_hook_input()
@@ -2065,6 +2134,8 @@ def main() -> None:
         handle_cwd_changed(payload, conn)
     elif mode == "crawl_project":
         handle_crawl_project(payload, conn)
+    elif mode == "worktree_create_hook":
+        handle_worktree_create_hook(payload, conn)
     elif mode == "worktree_create":
         handle_worktree_create(payload, conn)
     elif mode == "worktree_push":

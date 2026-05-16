@@ -18,12 +18,72 @@
         ]
       }
     ],
-    "Stop": [
+    "SessionEnd": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --session-end"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --subagent-start"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --subagent-stop"
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --worktree-create-hook"
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --worktree-remove"
+          }
+        ]
+      }
+    ],
+    "FileChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --file-changed"
+          }
+        ]
+      }
+    ],
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /home/ilari/Software/Repositories/multi-agent-CBS/coordinator.py --cwd-changed"
           }
         ]
       }
