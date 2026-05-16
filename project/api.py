@@ -19,6 +19,11 @@ def create_user(username: str, email: str) -> User:
     return storage.create_user(username=username, email=email)
 
 
+def delete_user(user_id: int) -> None:
+    if not storage.delete_user(user_id):
+        raise KeyError(f"User {user_id} not found")
+
+
 def get_item(item_id: int) -> Item:
     item = storage.get_item(item_id)
     if item is None:
