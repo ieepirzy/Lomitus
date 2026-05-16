@@ -26,9 +26,11 @@ class User:
 
 @dataclass
 class Task:
-    id: int
+    id: str
     title: str
+    description: str
     status: TaskStatus = TaskStatus.PENDING
     priority_score: float = 0.0
     tags: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: Optional[datetime] = None
