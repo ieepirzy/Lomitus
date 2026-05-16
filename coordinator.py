@@ -12,6 +12,8 @@ Flags:
   --worktree-create   create a git worktree + branch for an agent, register in DB
   --worktree-push     merge agent branch → main, re-index changed files in canonical DB
   --worktree-pull     rebase agent worktree onto latest main, update base_commit in DB
+  --worktree-status   refresh + report live status of all registered worktrees (JSON stdout)
+  --worktree-log      query the worktree event log (JSON stdout); filter by agent/path/limit
   --worktree-remove   remove worktree + branch, release all agent locks
 
 Usage in .claude/settings.json:
@@ -97,13 +99,33 @@ CREATE TABLE IF NOT EXISTS bloom_state (
 );
 
 CREATE TABLE IF NOT EXISTS worktrees (
-    worktree_path TEXT PRIMARY KEY,
-    agent_id      TEXT,
-    session_id    TEXT,
-    branch_name   TEXT,
-    base_commit   TEXT,
-    created_at    TEXT DEFAULT (datetime('now'))
+    worktree_path    TEXT PRIMARY KEY,
+    agent_id         TEXT,
+    session_id       TEXT,
+    branch_name      TEXT,
+    base_commit      TEXT,
+    current_commit   TEXT,
+    commits_ahead    INTEGER DEFAULT 0,
+    is_dirty         INTEGER DEFAULT 0,
+    changed_files    TEXT DEFAULT '[]',
+    last_status_at   TEXT,
+    created_at       TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS worktree_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    event          TEXT NOT NULL,
+    worktree_path  TEXT NOT NULL,
+    agent_id       TEXT,
+    branch_name    TEXT,
+    from_commit    TEXT,
+    to_commit      TEXT,
+    detail         TEXT,
+    occurred_at    TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_wt_events_agent ON worktree_events(agent_id);
+CREATE INDEX IF NOT EXISTS idx_wt_events_path  ON worktree_events(worktree_path);
 
 CREATE TABLE IF NOT EXISTS snapshots (
     node_id        TEXT PRIMARY KEY,
@@ -186,6 +208,33 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE worktrees ADD COLUMN branch_name TEXT")
     if "base_commit" not in wt_cols:
         conn.execute("ALTER TABLE worktrees ADD COLUMN base_commit TEXT")
+    # v3 → v4: add live status columns to worktrees.
+    if "current_commit" not in wt_cols:
+        conn.execute("ALTER TABLE worktrees ADD COLUMN current_commit TEXT")
+    if "commits_ahead" not in wt_cols:
+        conn.execute("ALTER TABLE worktrees ADD COLUMN commits_ahead INTEGER DEFAULT 0")
+    if "is_dirty" not in wt_cols:
+        conn.execute("ALTER TABLE worktrees ADD COLUMN is_dirty INTEGER DEFAULT 0")
+    if "changed_files" not in wt_cols:
+        conn.execute("ALTER TABLE worktrees ADD COLUMN changed_files TEXT DEFAULT '[]'")
+    if "last_status_at" not in wt_cols:
+        conn.execute("ALTER TABLE worktrees ADD COLUMN last_status_at TEXT")
+    # v4 → v5: worktree event log.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS worktree_events (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            event          TEXT NOT NULL,
+            worktree_path  TEXT NOT NULL,
+            agent_id       TEXT,
+            branch_name    TEXT,
+            from_commit    TEXT,
+            to_commit      TEXT,
+            detail         TEXT,
+            occurred_at    TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_wt_events_agent ON worktree_events(agent_id);
+        CREATE INDEX IF NOT EXISTS idx_wt_events_path  ON worktree_events(worktree_path);
+    """)
     conn.commit()
 
 
@@ -231,6 +280,101 @@ def _worktree_to_canonical(file_path: str, conn: sqlite3.Connection) -> str | No
                 return None
             return str(Path(main_root) / rel)
     return None
+
+
+def _refresh_worktree_status(worktree_path: str, conn: sqlite3.Connection) -> dict:
+    """
+    Query a worktree's live git state and persist it to the worktrees table.
+    Returns the status dict (useful for printing without a second DB read).
+    """
+    row = conn.execute(
+        "SELECT branch_name, base_commit FROM worktrees WHERE worktree_path = ?",
+        (worktree_path,),
+    ).fetchone()
+    branch_name = row[0] if row else None
+    base_commit  = row[1] if row else None
+
+    # Current HEAD.
+    _, current_commit, _ = _git(["rev-parse", "HEAD"], cwd=worktree_path)
+
+    # How many commits ahead of main is this branch?
+    try:
+        main_root = _main_repo_root(worktree_path)
+        _, ahead_str, _ = _git(
+            ["rev-list", "--count", "main..HEAD"], cwd=worktree_path
+        )
+        commits_ahead = int(ahead_str) if ahead_str.isdigit() else 0
+    except Exception:
+        main_root = worktree_path
+        commits_ahead = 0
+
+    # Uncommitted changes (staged + unstaged).
+    _, dirty_out, _ = _git(["status", "--porcelain"], cwd=worktree_path)
+    is_dirty = 1 if dirty_out.strip() else 0
+
+    # Files changed since base_commit (or all commits if no base recorded).
+    if base_commit and base_commit != current_commit:
+        _, diff_out, _ = _git(
+            ["diff", "--name-only", base_commit, "HEAD"], cwd=worktree_path
+        )
+    elif base_commit == current_commit:
+        # Only uncommitted changes relative to HEAD.
+        _, diff_out, _ = _git(["diff", "--name-only", "HEAD"], cwd=worktree_path)
+    else:
+        diff_out = ""
+
+    changed_files = [f for f in diff_out.splitlines() if f]
+
+    # Include working-tree dirty files not yet committed.
+    if dirty_out.strip():
+        dirty_files = [
+            line[3:].strip() for line in dirty_out.splitlines() if line.strip()
+        ]
+        changed_files = list(dict.fromkeys(changed_files + dirty_files))
+
+    status = {
+        "worktree_path": worktree_path,
+        "branch_name": branch_name,
+        "base_commit": base_commit,
+        "current_commit": current_commit,
+        "commits_ahead": commits_ahead,
+        "is_dirty": bool(is_dirty),
+        "changed_files": changed_files,
+    }
+
+    with conn:
+        conn.execute(
+            "UPDATE worktrees SET current_commit=?, commits_ahead=?, is_dirty=?, "
+            "changed_files=?, last_status_at=datetime('now') WHERE worktree_path=?",
+            (
+                current_commit,
+                commits_ahead,
+                is_dirty,
+                json.dumps(changed_files),
+                worktree_path,
+            ),
+        )
+    return status
+
+
+def _log_worktree_event(
+    event: str,
+    worktree_path: str,
+    conn: sqlite3.Connection,
+    *,
+    agent_id: str | None = None,
+    branch_name: str | None = None,
+    from_commit: str | None = None,
+    to_commit: str | None = None,
+    detail: str | None = None,
+) -> None:
+    with conn:
+        conn.execute(
+            "INSERT INTO worktree_events "
+            "(event, worktree_path, agent_id, branch_name, from_commit, to_commit, detail) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (event, worktree_path, agent_id, branch_name, from_commit, to_commit, detail),
+        )
 
 
 def _agent_view_stale(file_path: str, conn: sqlite3.Connection) -> list[str]:
@@ -1080,6 +1224,100 @@ def handle_crawl_project(payload: dict, conn: sqlite3.Connection) -> None:
     sys.exit(0)
 
 
+def handle_worktree_log(payload: dict, conn: sqlite3.Connection) -> None:
+    """
+    Print the worktree event log as JSON to stdout.
+
+    Payload (all optional):
+        worktree_path  — filter to a single worktree
+        agent_id       — filter to a single agent
+        limit          — max rows to return (default 100)
+
+    Invoke via:
+        echo '{}' | python coordinator.py --worktree-log
+        echo '{"agent_id": "agent-1", "limit": 20}' | python coordinator.py --worktree-log
+    """
+    wt_filter    = payload.get("worktree_path", "")
+    agent_filter = payload.get("agent_id", "")
+    limit        = int(payload.get("limit", 100))
+
+    where, params = [], []
+    if wt_filter:
+        where.append("worktree_path = ?")
+        params.append(wt_filter)
+    if agent_filter:
+        where.append("agent_id = ?")
+        params.append(agent_filter)
+
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    params.append(limit)
+
+    rows = conn.execute(
+        f"SELECT id, event, worktree_path, agent_id, branch_name, "
+        f"from_commit, to_commit, detail, occurred_at "
+        f"FROM worktree_events {clause} ORDER BY id DESC LIMIT ?",
+        params,
+    ).fetchall()
+
+    events = [
+        {
+            "id": r[0],
+            "event": r[1],
+            "worktree_path": r[2],
+            "agent_id": r[3],
+            "branch_name": r[4],
+            "from_commit": r[5][:8] if r[5] else None,
+            "to_commit": r[6][:8] if r[6] else None,
+            "detail": r[7],
+            "occurred_at": r[8],
+        }
+        for r in rows
+    ]
+    print(json.dumps(events, indent=2), flush=True)
+    sys.exit(0)
+
+
+def handle_worktree_status(payload: dict, conn: sqlite3.Connection) -> None:
+    """
+    Refresh and report the live status of every registered worktree (or one
+    specific worktree if worktree_path is given in the payload).
+
+    Output is JSON to stdout; progress/errors go to stderr.
+
+    Invoke via:
+        echo '{}' | python coordinator.py --worktree-status
+        echo '{"worktree_path": "/tmp/wt-agent-1"}' | python coordinator.py --worktree-status
+    """
+    target = payload.get("worktree_path", "")
+    if target:
+        rows = conn.execute(
+            "SELECT worktree_path FROM worktrees WHERE worktree_path = ?", (target,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT worktree_path FROM worktrees").fetchall()
+
+    if not rows:
+        print(json.dumps([]), flush=True)
+        sys.exit(0)
+
+    results = []
+    for (wt_path,) in rows:
+        if not Path(wt_path).is_dir():
+            results.append({
+                "worktree_path": wt_path,
+                "error": "directory not found",
+            })
+            continue
+        try:
+            status = _refresh_worktree_status(wt_path, conn)
+            results.append(status)
+        except Exception as exc:
+            results.append({"worktree_path": wt_path, "error": str(exc)})
+
+    print(json.dumps(results, indent=2), flush=True)
+    sys.exit(0)
+
+
 def handle_worktree_create(payload: dict, conn: sqlite3.Connection) -> None:
     """
     Create a git worktree for an agent and register it in the DB.
@@ -1133,6 +1371,13 @@ def handle_worktree_create(payload: dict, conn: sqlite3.Connection) -> None:
             "VALUES (?, ?, ?, ?, ?)",
             (worktree_path, agent_id, session_id, branch_name, base_commit),
         )
+    _refresh_worktree_status(worktree_path, conn)
+    _log_worktree_event(
+        "create", worktree_path, conn,
+        agent_id=agent_id, branch_name=branch_name,
+        to_commit=base_commit,
+        detail=f"worktree created at '{worktree_path}'",
+    )
     print(
         f"worktree-create: '{branch_name}' at '{worktree_path}' (base {base_commit[:8]})",
         file=sys.stderr,
@@ -1174,6 +1419,9 @@ def handle_worktree_push(payload: dict, conn: sqlite3.Connection) -> None:
         print("worktree-push: worktree not registered in coordinator DB", file=sys.stderr)
         sys.exit(1)
 
+    # Record main HEAD before the merge so we can log from→to.
+    _, pre_merge_head, _ = _git(["rev-parse", "HEAD"], cwd=main_root)
+
     # Merge the agent branch into main with a merge commit (--no-ff preserves history).
     rc, _, err = _git(
         ["merge", branch_name, "--no-ff", "-m",
@@ -1181,6 +1429,12 @@ def handle_worktree_push(payload: dict, conn: sqlite3.Connection) -> None:
         cwd=main_root,
     )
     if rc != 0:
+        _log_worktree_event(
+            "push_failed", worktree_path, conn,
+            agent_id=agent_id, branch_name=branch_name,
+            from_commit=pre_merge_head,
+            detail=f"merge conflict: {err[:200]}",
+        )
         print(f"worktree-push: merge failed — {err}. Resolve conflicts then retry.", file=sys.stderr)
         sys.exit(1)
 
@@ -1210,6 +1464,13 @@ def handle_worktree_push(payload: dict, conn: sqlite3.Connection) -> None:
             (new_head, worktree_path),
         )
 
+    _refresh_worktree_status(worktree_path, conn)
+    _log_worktree_event(
+        "push", worktree_path, conn,
+        agent_id=agent_id, branch_name=branch_name,
+        from_commit=pre_merge_head, to_commit=new_head,
+        detail=f"merged into main; re-indexed {indexed} file(s)",
+    )
     print(
         f"worktree-push: merged '{branch_name}' → main, re-indexed {indexed} file(s)",
         file=sys.stderr,
@@ -1241,9 +1502,23 @@ def handle_worktree_pull(payload: dict, conn: sqlite3.Connection) -> None:
         print("worktree-pull: could not resolve main repo root", file=sys.stderr)
         sys.exit(1)
 
+    _, pre_rebase_head, _ = _git(["rev-parse", "HEAD"], cwd=worktree_path)
+    row = conn.execute(
+        "SELECT agent_id, branch_name FROM worktrees WHERE worktree_path = ?",
+        (worktree_path,),
+    ).fetchone()
+    agent_id    = row[0] if row else None
+    branch_name = row[1] if row else None
+
     # Rebase the agent's branch onto the current main HEAD.
     rc, _, err = _git(["rebase", "main"], cwd=worktree_path)
     if rc != 0:
+        _log_worktree_event(
+            "pull_failed", worktree_path, conn,
+            agent_id=agent_id, branch_name=branch_name,
+            from_commit=pre_rebase_head,
+            detail=f"rebase conflict: {err[:200]}",
+        )
         print(
             f"worktree-pull: rebase failed — {err}. "
             "Resolve conflicts, then run 'git rebase --continue' in the worktree.",
@@ -1258,6 +1533,13 @@ def handle_worktree_pull(payload: dict, conn: sqlite3.Connection) -> None:
             (new_base, worktree_path),
         )
 
+    _refresh_worktree_status(worktree_path, conn)
+    _log_worktree_event(
+        "pull", worktree_path, conn,
+        agent_id=agent_id, branch_name=branch_name,
+        from_commit=pre_rebase_head, to_commit=new_base,
+        detail="rebased onto main",
+    )
     print(f"worktree-pull: rebased onto main (new HEAD {new_base[:8]})", file=sys.stderr)
     sys.exit(0)
 
@@ -1300,6 +1582,12 @@ def handle_worktree_remove(payload: dict, conn: sqlite3.Connection) -> None:
         if delete_branch and branch_name:
             _git(["branch", "-d", branch_name], cwd=main_root)
 
+    _log_worktree_event(
+        "remove", worktree_path, conn,
+        agent_id=agent_id if row else None,
+        branch_name=branch_name,
+        detail=f"delete_branch={delete_branch}",
+    )
     with conn:
         conn.execute("DELETE FROM worktrees WHERE worktree_path = ?", (worktree_path,))
 
@@ -1335,6 +1623,8 @@ def main() -> None:
     elif "--worktree-create" in args: mode = "worktree_create"
     elif "--worktree-push"   in args: mode = "worktree_push"
     elif "--worktree-pull"   in args: mode = "worktree_pull"
+    elif "--worktree-status" in args: mode = "worktree_status"
+    elif "--worktree-log"    in args: mode = "worktree_log"
     elif "--worktree-remove" in args: mode = "worktree_remove"
     elif "--post-tool-batch" in args: mode = "post_tool_batch"
     elif "--pre-compact"     in args: mode = "pre_compact"
@@ -1390,6 +1680,10 @@ def main() -> None:
         handle_worktree_push(payload, conn)
     elif mode == "worktree_pull":
         handle_worktree_pull(payload, conn)
+    elif mode == "worktree_status":
+        handle_worktree_status(payload, conn)
+    elif mode == "worktree_log":
+        handle_worktree_log(payload, conn)
     elif mode == "worktree_remove":
         handle_worktree_remove(payload, conn)
     elif mode == "post_tool_batch":
