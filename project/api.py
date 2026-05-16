@@ -35,9 +35,9 @@ def list_items(owner_id: int | None = None) -> List[Item]:
     return storage.list_items(owner_id=owner_id)
 
 
-def create_item(name: str, owner_id: int, description: str = "") -> Item:
+def create_item(name: str, owner_id: int, description: str = "", tags: list[str] | None = None) -> Item:
     get_user(owner_id)  # validates owner exists
-    return storage.create_item(name=name, owner_id=owner_id, description=description)
+    return storage.create_item(name=name, owner_id=owner_id, description=description, tags=tags)
 
 
 def delete_item(item_id: int) -> None:
