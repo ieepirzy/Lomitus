@@ -262,7 +262,8 @@ The coordinator should classify dependency nodes by type:
 
 This avoids false blocks on trivially non-conflicting edits while maintaining full protection on the nodes where semantic conflicts actually occur. The classification is statically determinable from the AST node type — no LLM needed.
 
-> Note: destructive edits to benign nodes will still be blocked when a lock is shared.
+> [!IMPORTANT] Benign nodes do not need to be locked as long as they are not the target of an edit
+> edits targeting benign nodes directly will still be blocked when a lock is shared.
 
 ### Cold cache rule
 
@@ -417,7 +418,26 @@ GPLv3. Commercial products may ship the coordinator as an unmodified subprocess.
 
 ---
 
-*Design developed May 2026. v0 confirmed working.*
+## OPEN TODOs (16.05.2026):
+
+The Strategic Path forward: Replacing the Git Transport Layer
+Since you've proven that your SQLite dependency tracker perfectly gates execution, the Git CLI is acting as a redundant, slow database layer.
+
+[Agent A writes node] ──► PostToolUse ──► Update SQLite Cache ──► Write to Main Repo FS
+                                                                         │
+                                       ┌─────────────────────────────────┘
+                                       ▼
+[Agent B PreToolUse]  ──► Merkle Mismatch Detected ──► Python shutil.copy2() (No Git CLI)
+                                                                         │
+                                       ┌─────────────────────────────────┘
+                                       ▼
+                               Near 0ms Latency
+
+Instead of running _auto_commit_and_push via process forks, your coordinator can copy the validated structural node text changes directly into the canonical main repo directory via Python filesystem operations, updating your nodes table instantly.
+
+You then defer Git compilation entirely to SessionEnd
+
+*Design developed May 2026.*
 © Ilari Pirkkalainen [ieepirzy](https://github.com/ieepirzy) 2026
 
 **AUTHORIZED EYES ONLY DOCUMENT NOT MEANT FOR PUBLIC DISCLOSURE OR CIRCULATION UNTIL INTENTIONAL PUBLIC RELEASE**

@@ -259,6 +259,7 @@ def _is_python(file_path: str) -> bool:
 # Git worktree helpers
 # ---------------------------------------------------------------------------
 
+#TODO: replace this retarded shit with pygit2 or similar, this fucking line hammers the OS with processes
 def _git(args: list[str], cwd: str) -> tuple[int, str, str]:
     r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
     return r.returncode, r.stdout.strip(), r.stderr.strip()
@@ -498,6 +499,10 @@ def _subgraph_stale(
             wt_parsed_cache[wt_file] = {}
 
     # --- fast path: compare combined hashes ---
+
+    #TODO: why are these sorted? This messes with the topology of the merkle tree.
+    #If Agent 2 adds a field to models.py::Item and Agent 3 adds a field to storage.py::create_item, the global flat token hash will detect a mismatch
+    #slow path won't know which node broke the specific 1-hop edge dependency of the target file.
     db_tokens = sorted(
         f"{name}:{h}"
         for nodes in canonical_db.values()
@@ -509,6 +514,7 @@ def _subgraph_stale(
         if wt_file in wt_to_canonical
         for name, h in parsed.items()
     )
+    #TODO: the Merkle root must be calculated hierarchically per target file subgraph context, not as a flat global sort of all active nodes. SEE ABOVE
     if (
         hashlib.sha256("|".join(db_tokens).encode()).hexdigest()
         == hashlib.sha256("|".join(wt_tokens).encode()).hexdigest()
@@ -1034,6 +1040,8 @@ def handle_pretool(
     # allow without lock — unless another agent holds a structural lock on this file.
     # A benign edit (e.g. removing an import) can invalidate a concurrent structural edit
     # being reasoned about by the lock holder.
+
+    #TODO: align with README spec ~lines 265-266
     if not structural_targets:
         other_lock = conn.execute(
             "SELECT agent_id FROM locks WHERE file_path = ? AND agent_id != ? LIMIT 1",
@@ -1197,6 +1205,7 @@ def handle_release(
         stored_nodes = json.loads(subgraph_nodes_json) if subgraph_nodes_json else []
         recomputed   = compute_merkle_root_from_node_ids(stored_nodes, conn)
 
+        #TODO: implement rollback
         if recomputed != stored_hash:
             try:
                 raise NotImplementedError("rollback not implemented — v2")
