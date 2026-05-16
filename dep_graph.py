@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from contract import EXTERNAL_CALL_PREFIXES
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
     node_id      TEXT PRIMARY KEY,
@@ -44,15 +46,32 @@ class Node:
     node_id: str
     file_path: str
     name: str | None
-    kind: Literal["structural", "benign"]
+    kind: Literal["structural", "external", "benign"]
     line_start: int
     line_end: int
     content_hash: str
 
 
-def _classify(stmt: ast.stmt) -> Literal["structural", "benign"]:
+def _call_root(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return _call_root(node.value)
+    return None
+
+
+def _has_external_calls(stmt: ast.stmt) -> bool:
+    for node in ast.walk(stmt):
+        if isinstance(node, ast.Call):
+            root = _call_root(node.func)
+            if root and root in EXTERNAL_CALL_PREFIXES:
+                return True
+    return False
+
+
+def _classify(stmt: ast.stmt) -> Literal["structural", "external", "benign"]:
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return "structural"
+        return "external" if _has_external_calls(stmt) else "structural"
     return "benign"
 
 

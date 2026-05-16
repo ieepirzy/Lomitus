@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import uuid as _uuid
 from pathlib import Path
 
 from dep_graph import (
@@ -45,6 +46,7 @@ from dep_graph import (
     update_file,
 )
 from bloom import load_bloom, save_bloom
+from contract import capture_node_snapshot, is_superset, take_snapshot
 
 DB_PATH = Path(".claude/coordinator.db")
 
@@ -94,6 +96,34 @@ CREATE TABLE IF NOT EXISTS worktrees (
     created_at    TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS snapshots (
+    node_id        TEXT PRIMARY KEY,
+    file_path      TEXT NOT NULL,
+    source_content TEXT NOT NULL,
+    io_snapshot    TEXT,
+    io_args        TEXT,
+    snapshotted_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS cascades (
+    cascade_id      TEXT PRIMARY KEY,
+    root_node       TEXT NOT NULL,
+    agent_id        TEXT NOT NULL,
+    cascade_nodes   TEXT NOT NULL,
+    completed_nodes TEXT NOT NULL DEFAULT '[]',
+    status          TEXT NOT NULL DEFAULT 'in_progress',
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS lock_queue (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id   TEXT NOT NULL,
+    agent_id  TEXT NOT NULL,
+    priority  INTEGER NOT NULL DEFAULT 0,
+    queued_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(node_id, agent_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_locks_file ON locks(file_path);
 CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
 CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file);
@@ -120,6 +150,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if cols and "node_id" not in cols:
         conn.execute("DROP TABLE IF EXISTS locks")
     conn.executescript(SCHEMA)
+    # v1 → v2: add expires_at to locks.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(locks)").fetchall()}
+    if "expires_at" not in cols:
+        conn.execute("ALTER TABLE locks ADD COLUMN expires_at TEXT")
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +219,185 @@ def _is_sentinel(node_id: str) -> bool:
     return node_id.endswith("::__file__")
 
 
+# TTL heuristic: base + 2 s per line of the target function.
+_BASE_TTL     = 30
+_PER_LINE_TTL = 2
+
+# Agent priority: higher value = served first from the lock queue.
+_PRIORITY_MAP: dict[str | None, int] = {
+    "orchestrator": 100,
+    "senior": 80,
+    "lead": 80,
+}
+_DEFAULT_PRIORITY = 0
+
+
+# ---------------------------------------------------------------------------
+# v2 helpers
+# ---------------------------------------------------------------------------
+
+def _compute_ttl(node_id: str, conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT line_start, line_end FROM nodes WHERE node_id = ?", (node_id,)
+    ).fetchone()
+    if not row:
+        return _BASE_TTL
+    return _BASE_TTL + max(0, row[1] - row[0]) * _PER_LINE_TTL
+
+
+def _agent_priority(agent_type: str | None) -> int:
+    return _PRIORITY_MAP.get(agent_type, _DEFAULT_PRIORITY)
+
+
+def _enqueue_agent(node_id: str, agent_id: str, agent_type: str | None, conn: sqlite3.Connection) -> None:
+    priority = _agent_priority(agent_type)
+    conn.execute(
+        "INSERT OR IGNORE INTO lock_queue (node_id, agent_id, priority) VALUES (?, ?, ?)",
+        (node_id, agent_id, priority),
+    )
+    conn.commit()
+
+
+def _queue_position(node_id: str, agent_id: str, conn: sqlite3.Connection) -> int:
+    """Return 0-based position of agent_id in the queue for node_id (0 = front)."""
+    rows = conn.execute(
+        "SELECT agent_id FROM lock_queue WHERE node_id = ? ORDER BY priority DESC, id ASC",
+        (node_id,),
+    ).fetchall()
+    for i, (aid,) in enumerate(rows):
+        if aid == agent_id:
+            return i
+    return 0
+
+
+def _dequeue_agent(node_id: str, agent_id: str, conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "DELETE FROM lock_queue WHERE node_id = ? AND agent_id = ?", (node_id, agent_id)
+    )
+    conn.commit()
+
+
+def _store_snapshot(
+    node_id: str,
+    file_path: str,
+    func_name: str | None,
+    project_root: str,
+    caller_sources: list[str],
+    conn: sqlite3.Connection,
+) -> None:
+    """Take and store an I/O snapshot at lock acquisition (skipped for external nodes)."""
+    if conn.execute("SELECT 1 FROM snapshots WHERE node_id = ?", (node_id,)).fetchone():
+        return  # already snapshotted from a prior lock acquisition
+    kind_row = conn.execute("SELECT kind FROM nodes WHERE node_id = ?", (node_id,)).fetchone()
+    if kind_row and kind_row[0] == "external":
+        return  # external nodes are not executed
+    try:
+        source_content = Path(file_path).read_text(encoding="utf-8")
+    except OSError:
+        return
+    args, io_snap = capture_node_snapshot(file_path, func_name, project_root, caller_sources)
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO snapshots "
+            "(node_id, file_path, source_content, io_snapshot, io_args) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (node_id, file_path, source_content,
+             json.dumps(io_snap) if io_snap is not None else None,
+             json.dumps(args)    if args    is not None else None),
+        )
+
+
+def _cascade_trigger(
+    file_path: str,
+    root_node: str,
+    agent_id: str,
+    agent_type: str | None,
+    conn: sqlite3.Connection,
+) -> list[str]:
+    """
+    Crawl reverse edges from file_path, acquire cascade locks on all dependent
+    structural nodes (innermost / direct callers first), and record the cascade.
+    Returns the list of cascade node_ids, empty if nothing to cascade.
+    """
+    direct = {r[0] for r in conn.execute(
+        "SELECT from_file FROM edges WHERE to_file = ?", (file_path,)
+    ).fetchall()}
+    all_dep_files = crawl_subgraph(file_path, depth=2, conn=conn, direction="reverse") - {file_path}
+    # Direct callers first (innermost), then transitive.
+    ordered = sorted(all_dep_files, key=lambda f: (f not in direct, f))
+
+    cascade_nodes: list[str] = []
+    bloom = load_bloom(conn)
+    with conn:
+        for dep_file in ordered:
+            rows = conn.execute(
+                "SELECT node_id, file_path FROM nodes "
+                "WHERE file_path = ? AND kind IN ('structural', 'external')",
+                (dep_file,),
+            ).fetchall()
+            for nid, nfp in rows:
+                existing = conn.execute(
+                    "SELECT agent_id FROM locks WHERE node_id = ?", (nid,)
+                ).fetchone()
+                if existing and existing[0] != agent_id:
+                    continue  # locked by another agent — skip, don't block cascade
+                if not existing:
+                    ttl = _compute_ttl(nid, conn)
+                    conn.execute(
+                        "INSERT OR IGNORE INTO locks "
+                        "(node_id, file_path, agent_id, agent_type, expires_at) "
+                        "VALUES (?, ?, ?, 'cascade', datetime('now', ? || ' seconds'))",
+                        (nid, nfp, agent_id, f"+{ttl}"),
+                    )
+                    bloom.add(nid)
+                cascade_nodes.append(nid)
+
+    if cascade_nodes:
+        save_bloom(conn, bloom)
+        cascade_id = _uuid.uuid4().hex[:8]
+        with conn:
+            conn.execute(
+                "INSERT INTO cascades "
+                "(cascade_id, root_node, agent_id, cascade_nodes, completed_nodes) "
+                "VALUES (?, ?, ?, ?, '[]')",
+                (cascade_id, root_node, agent_id, json.dumps(cascade_nodes)),
+            )
+
+    return cascade_nodes
+
+
+def _cascade_mark_complete(node_id: str, agent_id: str, conn: sqlite3.Connection) -> bool:
+    """
+    Mark node_id complete in any in-progress cascade owned by agent_id.
+    Returns True if marking this node finishes the entire cascade.
+    """
+    rows = conn.execute(
+        "SELECT cascade_id, cascade_nodes, completed_nodes FROM cascades "
+        "WHERE agent_id = ? AND status = 'in_progress'",
+        (agent_id,),
+    ).fetchall()
+    for cascade_id, cascade_json, completed_json in rows:
+        cascade_nodes = json.loads(cascade_json)
+        if node_id not in cascade_nodes:
+            continue
+        completed = json.loads(completed_json)
+        if node_id not in completed:
+            completed.append(node_id)
+        with conn:
+            conn.execute(
+                "UPDATE cascades SET completed_nodes = ? WHERE cascade_id = ?",
+                (json.dumps(completed), cascade_id),
+            )
+        if set(completed) >= set(cascade_nodes):
+            with conn:
+                conn.execute(
+                    "UPDATE cascades SET status = 'complete' WHERE cascade_id = ?",
+                    (cascade_id,),
+                )
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # PreToolUse
 # ---------------------------------------------------------------------------
@@ -203,13 +416,13 @@ def handle_pretool(
     if not is_indexed(file_path, conn):
         index_file(file_path, project_root, conn)
 
-    # 2. Identify which nodes this edit targets; filter to structural only.
+    # 2. Identify which nodes this edit targets; filter to structural/external.
     target_node_ids = identify_target_nodes(file_path, tool_name, tool_input, conn)
     if target_node_ids:
         ph, vals = _in_clause(target_node_ids)
         structural_targets = [
             r[0] for r in conn.execute(
-                f"SELECT node_id FROM nodes WHERE node_id IN ({ph}) AND kind = 'structural'",
+                f"SELECT node_id FROM nodes WHERE node_id IN ({ph}) AND kind IN ('structural', 'external')",
                 vals,
             ).fetchall()
         ]
@@ -261,12 +474,12 @@ def handle_pretool(
     target_conflicts = [(nid, check_locked_by_other(nid)) for nid in structural_targets]
     target_conflicts = [(nid, b) for nid, b in target_conflicts if b]
 
-    # Check structural nodes in direct dependencies.
+    # Check structural/external nodes in direct dependencies.
     dep_conflicts: list[tuple[str, str]] = []
     if dep_files:
         ph, vals = _in_clause(dep_files)
         dep_structural = conn.execute(
-            f"SELECT node_id FROM nodes WHERE file_path IN ({ph}) AND kind = 'structural'",
+            f"SELECT node_id FROM nodes WHERE file_path IN ({ph}) AND kind IN ('structural', 'external')",
             vals,
         ).fetchall()
         for (dep_nid,) in dep_structural:
@@ -276,8 +489,22 @@ def handle_pretool(
 
     all_conflicts = target_conflicts + dep_conflicts
     if all_conflicts:
+        # Check if any conflict is a cascade lock.
+        cascade_detail = ""
+        for nid, blocker in all_conflicts:
+            lock_row = conn.execute(
+                "SELECT agent_type FROM locks WHERE node_id = ?", (nid,)
+            ).fetchone()
+            if lock_row and lock_row[0] == "cascade":
+                cascade_detail = f" (cascade refactor in progress by '{blocker}')"
+                break
+        # Queue this agent for each conflicting target node.
+        for nid in structural_targets:
+            _enqueue_agent(nid, agent_id, agent_type, conn)
+        positions = [_queue_position(nid, agent_id, conn) for nid in structural_targets]
+        pos_str = f"queue position {min(positions)}" if positions else "queued"
         details = "; ".join(f"'{nid}' held by '{b}'" for nid, b in all_conflicts)
-        block(f"Lock conflict — {details}. Replan.")
+        block(f"Lock conflict{cascade_detail} — {details}. {pos_str}. Replan.")
 
     # 5. Compute subgraph snapshot for drift detection at PostToolUse.
     all_files = {file_path} | dep_files
@@ -292,13 +519,14 @@ def handle_pretool(
     # 6. Acquire locks — single transaction, all-or-nothing.
     with conn:
         for nid in structural_targets:
+            ttl = _compute_ttl(nid, conn)
             try:
                 conn.execute(
                     "INSERT INTO locks "
-                    "(node_id, file_path, agent_id, agent_type, subgraph_hash, subgraph_nodes) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(node_id, file_path, agent_id, agent_type, subgraph_hash, subgraph_nodes, expires_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ? || ' seconds'))",
                     (nid, file_path, agent_id, agent_type,
-                     subgraph_hash, json.dumps(subgraph_node_ids)),
+                     subgraph_hash, json.dumps(subgraph_node_ids), f"+{ttl}"),
                 )
             except sqlite3.IntegrityError:
                 row = conn.execute(
@@ -307,16 +535,33 @@ def handle_pretool(
                 if row and row[0] != agent_id:
                     # Bloom false negative — another agent acquired between check and insert.
                     block(f"Node '{nid}' locked by '{row[0]}' (race). Replan.")
-                # Same agent re-entering: refresh the snapshot.
+                # Same agent re-entering: refresh subgraph snapshot and TTL.
                 conn.execute(
-                    "UPDATE locks SET subgraph_hash = ?, subgraph_nodes = ? WHERE node_id = ?",
-                    (subgraph_hash, json.dumps(subgraph_node_ids), nid),
+                    "UPDATE locks SET subgraph_hash = ?, subgraph_nodes = ?, "
+                    "expires_at = datetime('now', ? || ' seconds') WHERE node_id = ?",
+                    (subgraph_hash, json.dumps(subgraph_node_ids), f"+{ttl}", nid),
                 )
 
-    # 7. Update bloom after successful lock acquisition.
+    # 7. Update bloom and dequeue this agent (it's now the lock holder).
     for nid in structural_targets:
         bloom.add(nid)
+        _dequeue_agent(nid, agent_id, conn)
     save_bloom(conn, bloom)
+
+    # 8. Take I/O snapshots for contract validation at PostToolUse.
+    caller_files = crawl_subgraph(file_path, depth=1, conn=conn, direction="reverse") - {file_path}
+    caller_sources = []
+    for cf in caller_files:
+        try:
+            caller_sources.append(Path(cf).read_text(encoding="utf-8"))
+        except OSError:
+            pass
+    for nid in structural_targets:
+        if _is_sentinel(nid):
+            continue
+        name_row = conn.execute("SELECT name FROM nodes WHERE node_id = ?", (nid,)).fetchone()
+        _store_snapshot(nid, file_path, name_row[0] if name_row else None,
+                        project_root, caller_sources, conn)
 
     allow()
 
@@ -329,6 +574,7 @@ def handle_release(
     file_path: str,
     agent_id: str,
     conn: sqlite3.Connection,
+    agent_type: str | None = None,
 ) -> None:
     rows = conn.execute(
         "SELECT node_id, subgraph_hash, subgraph_nodes FROM locks "
@@ -378,6 +624,42 @@ def handle_release(
     # empty file, they are indexed here and visible to subsequent agents.
     update_file(file_path, project_root, conn)
 
+    # Contract validation: re-execute each node and compare structure against snapshot.
+    # A superset failure triggers the cascade flow (does not block the original edit).
+    for row in rows:
+        node_id, _, _ = row
+        if _is_sentinel(node_id):
+            continue
+        snap_row = conn.execute(
+            "SELECT io_snapshot, io_args FROM snapshots WHERE node_id = ?", (node_id,)
+        ).fetchone()
+        if not snap_row or not snap_row[0]:
+            continue
+        old_snap = json.loads(snap_row[0])
+        args     = json.loads(snap_row[1]) if snap_row[1] else []
+        name_row = conn.execute("SELECT name FROM nodes WHERE node_id = ?", (node_id,)).fetchone()
+        if not name_row or not name_row[0]:
+            continue
+        new_snap = take_snapshot(file_path, name_row[0], args, project_root)
+        if new_snap is None:
+            continue
+        if not is_superset(old_snap, new_snap):
+            cascade_nodes = _cascade_trigger(file_path, node_id, agent_id, agent_type, conn)
+            if cascade_nodes:
+                names = [n.rsplit("::", 1)[-1] for n in cascade_nodes]
+                revert_cmd = (
+                    f"echo '{{\"agent_id\": \"{agent_id}\"}}' "
+                    f"| python {Path(__file__).resolve()} --revert"
+                )
+                print(
+                    f"\nI/O contract change detected on '{name_row[0]}' by '{agent_id}'.\n"
+                    f"Dependents requiring update: {', '.join(names)}.\n"
+                    "Cascade lock acquired. Proceed with updates, or revert all changes with:\n"
+                    f"  {revert_cmd}",
+                    file=sys.stderr,
+                )
+
+    # Release locks for this file.
     conn.execute(
         "DELETE FROM locks WHERE file_path = ? AND agent_id = ?",
         (file_path, agent_id),
@@ -386,6 +668,17 @@ def handle_release(
     for row in rows:
         bloom.remove(row[0])
     save_bloom(conn, bloom)
+
+    # Cascade completion: mark each released node done; emit message if cascade finishes.
+    for row in rows:
+        node_id = row[0]
+        if _is_sentinel(node_id):
+            continue
+        if _cascade_mark_complete(node_id, agent_id, conn):
+            print(
+                f"Cascade complete for agent '{agent_id}' — all dependent contracts verified.",
+                file=sys.stderr,
+            )
 
     sys.exit(0)
 
@@ -416,15 +709,87 @@ def handle_failure(file_path: str, agent_id: str, conn: sqlite3.Connection) -> N
 
 
 # ---------------------------------------------------------------------------
+# Voluntary cascade revert
+# ---------------------------------------------------------------------------
+
+def handle_revert(payload: dict, conn: sqlite3.Connection) -> None:
+    """
+    Restore all cascade nodes (and the root node) to their pre-lock snapshots,
+    release all cascade locks, and mark the cascade reverted.
+
+    Invoked explicitly by the agent via Bash:
+        echo '{"agent_id": "..."}' | python coordinator.py --revert
+    """
+    agent_id = payload.get("agent_id") or payload.get("session_id", "unknown")
+
+    rows = conn.execute(
+        "SELECT cascade_id, root_node, cascade_nodes FROM cascades "
+        "WHERE agent_id = ? AND status = 'in_progress'",
+        (agent_id,),
+    ).fetchall()
+
+    if not rows:
+        print(f"No active cascade for agent '{agent_id}'.", file=sys.stderr)
+        sys.exit(0)
+
+    bloom = load_bloom(conn)
+
+    for cascade_id, root_node, cascade_nodes_json in rows:
+        cascade_nodes = json.loads(cascade_nodes_json)
+        all_nodes = [root_node] + [n for n in cascade_nodes if n != root_node]
+
+        reverted_files: set[str] = set()
+        for nid in all_nodes:
+            snap = conn.execute(
+                "SELECT file_path, source_content FROM snapshots WHERE node_id = ?",
+                (nid,),
+            ).fetchone()
+            if not snap or not snap[1] or snap[0] in reverted_files:
+                continue
+            file_path, source = snap
+            try:
+                Path(file_path).write_text(source, encoding="utf-8")
+                reverted_files.add(file_path)
+                # Re-index so the cache reflects the reverted content.
+                update_file(file_path, find_project_root(file_path), conn)
+            except OSError as e:
+                print(f"Revert write failed for '{file_path}': {e}", file=sys.stderr)
+
+        # Release all cascade locks.
+        with conn:
+            for nid in all_nodes:
+                conn.execute(
+                    "DELETE FROM locks WHERE node_id = ? AND agent_id = ?",
+                    (nid, agent_id),
+                )
+                bloom.remove(nid)
+            conn.execute(
+                "UPDATE cascades SET status = 'reverted' WHERE cascade_id = ?",
+                (cascade_id,),
+            )
+
+        root_name = root_node.rsplit("::", 1)[-1]
+        print(
+            f"Cascade reverted — '{root_name}' and {len(cascade_nodes)} dependent(s) "
+            "restored to pre-edit state.",
+            file=sys.stderr,
+        )
+
+    save_bloom(conn, bloom)
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
 def _release_agent_locks(agent_id: str, conn: sqlite3.Connection) -> None:
-    """Release all locks held by agent_id without updating cache (no edit confirmation)."""
+    """Release all locks and queue entries held by agent_id (no cache update)."""
     locked = conn.execute(
         "SELECT node_id FROM locks WHERE agent_id = ?", (agent_id,)
     ).fetchall()
     conn.execute("DELETE FROM locks WHERE agent_id = ?", (agent_id,))
+    conn.execute("DELETE FROM lock_queue WHERE agent_id = ?", (agent_id,))
     conn.commit()
     if locked:
         bloom = load_bloom(conn)
@@ -567,7 +932,8 @@ def handle_pre_compact(conn: sqlite3.Connection) -> None:
 def main() -> None:
     args = set(sys.argv[1:])
 
-    if   "--session-start"   in args: mode = "session_start"
+    if   "--revert"          in args: mode = "revert"
+    elif "--session-start"   in args: mode = "session_start"
     elif "--session-end"     in args: mode = "session_end"
     elif "--subagent-start"  in args: mode = "subagent_start"
     elif "--subagent-stop"   in args: mode = "subagent_stop"
@@ -595,15 +961,17 @@ def main() -> None:
             block("Coordinator error: DB unavailable.")
         sys.exit(0)
 
-    if mode == "pretool":
+    if mode == "revert":
+        handle_revert(payload, conn)
+    elif mode == "pretool":
         file_path, agent_id, agent_type, session_id, tool_name, tool_input = extract_context(payload)
         empty_path = str(Path("").resolve())
         if not file_path or file_path == empty_path:
             sys.exit(0)
         handle_pretool(file_path, agent_id, agent_type, tool_name, tool_input, conn)
     elif mode == "release":
-        file_path, agent_id, *_ = extract_context(payload)
-        handle_release(file_path, agent_id, conn)
+        file_path, agent_id, agent_type, *_ = extract_context(payload)
+        handle_release(file_path, agent_id, conn, agent_type)
     elif mode == "failure":
         file_path, agent_id, *_ = extract_context(payload)
         handle_failure(file_path, agent_id, conn)
