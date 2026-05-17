@@ -40,7 +40,8 @@ CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file);
 CREATE INDEX IF NOT EXISTS idx_edges_to   ON edges(to_file);
 """
 
-
+# TODO: implement effect typing for nodes, i.e pure,io,netowkr,db.. these should be propagated transitively
+# if a pure function calls an io function, then it's io.
 @dataclass(frozen=True)
 class Node:
     node_id: str
@@ -59,12 +60,12 @@ def _call_root(node: ast.expr) -> str | None:
         return _call_root(node.value)
     return None
 
-
+# TODO: refacor this to be durable, this should answer something closer to "does the call graph of this specific function reach a node with observable side effects at execution time."
 def _has_external_calls(stmt: ast.stmt) -> bool:
     for node in ast.walk(stmt):
         if isinstance(node, ast.Call):
             root = _call_root(node.func)
-            if root and root in EXTERNAL_CALL_PREFIXES:
+            if root and root in EXTERNAL_CALL_PREFIXES: #TODO: absolutely fucking not, this is not scalable in the slightest
                 return True
     return False
 

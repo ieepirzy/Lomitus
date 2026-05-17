@@ -17,6 +17,10 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+#TODO: What the fuck is this, this is just a list of existing ones for nodes that do network calls/have external deps
+#TODO: This shit has way too many false positives and negatives, this is way too weak to pass for production
+#TODO: this does not answer the question which external dependency nodes should "does the call graph of this specific function reach a node with observable side effects at execution time.""
+
 # Modules whose presence in a function body marks the node as "external".
 # External nodes are locked but skipped for I/O snapshot execution.
 EXTERNAL_CALL_PREFIXES: frozenset[str] = frozenset({
