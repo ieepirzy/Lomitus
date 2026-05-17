@@ -37,14 +37,20 @@ Usage in .claude/settings.json:
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
 import uuid as _uuid
 from pathlib import Path
+
+try:
+    import pygit2 as _pygit2
+    _HAS_PYGIT2 = True
+except ImportError:
+    _HAS_PYGIT2 = False
 
 from dep_graph import (
     compute_merkle_root,
@@ -259,19 +265,47 @@ def _is_python(file_path: str) -> bool:
 # Git worktree helpers
 # ---------------------------------------------------------------------------
 
-#TODO: replace this retarded shit with pygit2 or similar, this fucking line hammers the OS with processes
 def _git(args: list[str], cwd: str) -> tuple[int, str, str]:
     r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
+_main_repo_root_cache: dict[str, str] = {}
+
+
 def _main_repo_root(worktree_path: str) -> str:
     """Return the root of the main (canonical) repo given any worktree path."""
+    abs_wt = str(Path(worktree_path).resolve())
+    if abs_wt in _main_repo_root_cache:
+        return _main_repo_root_cache[abs_wt]
+
+    if _HAS_PYGIT2:
+        try:
+            repo = _pygit2.Repository(abs_wt)
+            git_dir = Path(repo.path.rstrip("/"))
+            # For a linked worktree, git_dir is <main>/.git/worktrees/<name>/.
+            # The 'commondir' file inside it points back to the shared .git dir.
+            commondir_file = git_dir / "commondir"
+            if commondir_file.exists():
+                common = commondir_file.read_text().strip()
+                if not Path(common).is_absolute():
+                    common = str((git_dir / common).resolve())
+                result = str(Path(common).parent)
+            else:
+                # Main repo (not a linked worktree) — git_dir is .git/ itself.
+                result = str(git_dir.parent)
+            _main_repo_root_cache[abs_wt] = result
+            return result
+        except Exception:
+            pass
+
     _, common_dir, _ = _git(["rev-parse", "--git-common-dir"], cwd=worktree_path)
     git_path = Path(common_dir)
     if not git_path.is_absolute():
         git_path = (Path(worktree_path) / git_path).resolve()
-    return str(git_path.parent)
+    result = str(git_path.parent)
+    _main_repo_root_cache[abs_wt] = result
+    return result
 
 
 def _worktree_to_canonical(file_path: str, conn: sqlite3.Connection) -> str | None:
@@ -449,7 +483,7 @@ def _subgraph_stale(
     dep_files: set[str],
     wt_path: str,
     conn: sqlite3.Connection,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """
     Compare the agent's worktree subgraph against the canonical DB using a
     two-phase approach:
@@ -486,7 +520,7 @@ def _subgraph_stale(
             canonical_db[can_abs] = {r[0].split("::")[-1]: r[1] for r in db_rows}
 
     if not canonical_db:
-        return []  # nothing indexed in canonical DB yet — not stale
+        return [], []  # nothing indexed in canonical DB yet — not stale
 
     # Parse worktree files once; cache results for slow path.
     wt_parsed_cache: dict[str, dict[str, str]] = {}
@@ -515,29 +549,36 @@ def _subgraph_stale(
         hashlib.sha256("|".join(db_tokens).encode()).hexdigest()
         == hashlib.sha256("|".join(wt_tokens).encode()).hexdigest()
     ):
-        return []  # fast path: subgraphs match
+        return [], []  # fast path: subgraphs match
 
-    # --- slow path: find which nodes are stale ---
-    stale: list[str] = []
+    # --- slow path: find which nodes and files are stale ---
+    stale_nodes: list[str] = []
+    stale_files: list[str] = []
     for wt_file, can_abs in wt_to_canonical.items():
         db_nodes = canonical_db.get(can_abs, {})
         wt_parsed = wt_parsed_cache.get(wt_file, {})
+        file_stale = False
         for name, db_hash in db_nodes.items():
             if name in wt_parsed and wt_parsed[name] != db_hash:
-                stale.append(f"{Path(wt_file).name}::{name}")
+                stale_nodes.append(f"{Path(wt_file).name}::{name}")
+                file_stale = True
+        if file_stale:
+            stale_files.append(wt_file)
 
-    return stale
+    return stale_nodes, stale_files
 
 
-def _auto_pull_worktree(
+def _sync_from_main(
     wt_path: str,
+    stale_wt_files: list[str],
     conn: sqlite3.Connection,
     agent_id: str | None = None,
 ) -> bool:
     """
-    Rebase the agent's worktree branch onto the current main HEAD.
-    Updates base_commit in DB and logs the event.
-    Returns True on success, False if rebase conflicted (aborted automatically).
+    Copy stale files from the main repo filesystem into the agent's worktree.
+    Replaces the old git-rebase-based auto-pull on the PreToolUse hot path —
+    no subprocess forks, no rebase conflict risk.
+    Returns True if all files were synced, False if any copy failed.
     """
     row = conn.execute(
         "SELECT agent_id, branch_name FROM worktrees WHERE worktree_path = ?",
@@ -546,35 +587,32 @@ def _auto_pull_worktree(
     effective_agent = agent_id or (row[0] if row else None)
     branch_name = row[1] if row else None
 
-    _, pre_head, _ = _git(["rev-parse", "HEAD"], cwd=wt_path)
-    rc, _, err = _git(["rebase", "main"], cwd=wt_path)
-    if rc != 0:
-        _git(["rebase", "--abort"], cwd=wt_path)
-        _log_worktree_event(
-            "pull_failed", wt_path, conn,
-            agent_id=effective_agent, branch_name=branch_name,
-            from_commit=pre_head,
-            detail=f"auto-rebase conflict (aborted): {err[:150]}",
-        )
-        return False
+    synced = 0
+    for wt_file in stale_wt_files:
+        canonical = _worktree_to_canonical(wt_file, conn)
+        if not canonical or not Path(canonical).is_file():
+            continue
+        try:
+            shutil.copy2(canonical, wt_file)
+            synced += 1
+        except OSError as e:
+            print(f"[coordinator] sync failed '{Path(wt_file).name}': {e}", file=sys.stderr)
+            _log_worktree_event(
+                "pull_failed", wt_path, conn,
+                agent_id=effective_agent, branch_name=branch_name,
+                detail=f"shutil sync failed for '{Path(wt_file).name}': {e}",
+            )
+            return False
 
-    _, new_head, _ = _git(["rev-parse", "HEAD"], cwd=wt_path)
-    with conn:
-        conn.execute(
-            "UPDATE worktrees SET base_commit = ? WHERE worktree_path = ?",
-            (new_head, wt_path),
-        )
-    _refresh_worktree_status(wt_path, conn)
     _log_worktree_event(
         "pull", wt_path, conn,
         agent_id=effective_agent, branch_name=branch_name,
-        from_commit=pre_head, to_commit=new_head,
-        detail="auto-pull on staleness detection",
+        detail=f"synced {synced} stale file(s) from main repo (no git rebase)",
     )
-    return True
+    return synced > 0
 
 
-def _auto_commit_and_push(
+def _propagate_to_main(
     file_path: str,
     wt_path: str,
     agent_id: str,
@@ -584,107 +622,35 @@ def _auto_commit_and_push(
     Called from PostToolUse (handle_release) when the edited file lives in a
     registered worktree.
 
-    Strategy — rebase-then-fast-forward with a file lock:
-      1. Commit the change to the agent's worktree branch.
-      2. Acquire an exclusive OS file lock on <main_root>/.git/coordinator-push.lock
-         so concurrent PostToolUse calls from different agents are serialised.
-      3. Rebase the worktree branch onto the latest main (incorporates any
-         changes that landed while this agent held its node lock).
-      4. Fast-forward main to the rebased branch HEAD (--ff-only, never conflicts).
-      5. Update base_commit in DB and release the file lock.
-
-    Why this eliminates merge conflicts:
-      - A rebase can surface a text conflict only when two agents edited the
-        *same lines* of the same file.  That case is already prevented upstream
-        by the node-level lock: two agents can only hold concurrent locks on
-        *different structural nodes* of the same file, which by definition
-        touch different lines.
-      - The fast-forward step is conflict-free by definition.
-      - The file lock means only one agent performs the rebase+ff at a time,
-        so main is always in a clean state when the lock is acquired.
+    Copies the validated file directly to the equivalent path in the main repo
+    working tree via shutil.copy2 — no git subprocess per edit.  Git compilation
+    is deferred to SessionEnd, where all propagated changes are staged and
+    squashed into one commit.  This eliminates the rebase-then-ff-merge per edit
+    that previously required ~8 subprocess forks on the PostToolUse hot path.
     """
-    try:
-        rel_path = str(Path(file_path).resolve().relative_to(Path(wt_path).resolve()))
-    except ValueError:
-        return
-
-    # --- Step 1: commit in the worktree ---
-    _git(["add", "-f", rel_path], cwd=wt_path)
-    _, status_out, _ = _git(["status", "--porcelain", rel_path], cwd=wt_path)
-    if not status_out.strip():
-        return  # nothing to commit (edit was a no-op on disk)
-
-    rc, _, err = _git(
-        ["commit", "-m", f"coordinator: {agent_id} edited {Path(rel_path).name}"],
-        cwd=wt_path,
-    )
-    if rc != 0:
-        print(f"[coordinator] auto-commit failed: {err}", file=sys.stderr)
+    canonical = _worktree_to_canonical(file_path, conn)
+    if not canonical:
         return
 
     row = conn.execute(
         "SELECT branch_name FROM worktrees WHERE worktree_path = ?", (wt_path,)
     ).fetchone()
-    if not row or not row[0]:
-        return
-    branch_name = row[0]
+    branch_name = row[0] if row else None
 
     try:
-        main_root = _main_repo_root(wt_path)
-    except Exception:
+        Path(canonical).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file_path, canonical)
+    except OSError as e:
+        print(f"[coordinator] propagate failed '{Path(file_path).name}': {e}", file=sys.stderr)
         return
 
-    # --- Step 2: acquire exclusive file lock on main repo ---
-    lock_path = str(Path(main_root) / ".git" / "coordinator-push.lock")
-    with open(lock_path, "w") as _lock_fh:
-        fcntl.flock(_lock_fh, fcntl.LOCK_EX)
-
-        _, pre_head, _ = _git(["rev-parse", "HEAD"], cwd=main_root)
-
-        # --- Step 3: rebase worktree branch onto latest main ---
-        rc, _, err = _git(["rebase", "main"], cwd=wt_path)
-        if rc != 0:
-            # Should be extremely rare given node-level locks; log and bail.
-            _git(["rebase", "--abort"], cwd=wt_path)
-            _log_worktree_event(
-                "push_failed", wt_path, conn,
-                agent_id=agent_id, branch_name=branch_name,
-                from_commit=pre_head,
-                detail=f"rebase conflict during auto-push: {err[:150]}",
-            )
-            print(f"[coordinator] auto-push rebase failed: {err}", file=sys.stderr)
-            return
-
-        # --- Step 4: fast-forward main to rebased branch HEAD ---
-        rc, _, err = _git(["merge", "--ff-only", branch_name], cwd=main_root)
-        if rc != 0:
-            # Should never happen after a successful rebase; defensive log.
-            _log_worktree_event(
-                "push_failed", wt_path, conn,
-                agent_id=agent_id, branch_name=branch_name,
-                from_commit=pre_head,
-                detail=f"ff-merge failed after rebase: {err[:150]}",
-            )
-            print(f"[coordinator] ff-merge failed: {err}", file=sys.stderr)
-            return
-
-        _, new_head, _ = _git(["rev-parse", "HEAD"], cwd=main_root)
-
-    # --- Step 5: update DB (outside file lock — no git ops) ---
-    with conn:
-        conn.execute(
-            "UPDATE worktrees SET base_commit = ? WHERE worktree_path = ?",
-            (new_head, wt_path),
-        )
-    _refresh_worktree_status(wt_path, conn)
     _log_worktree_event(
         "push", wt_path, conn,
         agent_id=agent_id, branch_name=branch_name,
-        from_commit=pre_head, to_commit=new_head,
-        detail=f"auto-push from PostToolUse: {Path(rel_path).name}",
+        detail=f"propagated '{Path(file_path).name}' to main repo (deferred git)",
     )
     print(
-        f"[coordinator] auto-pushed '{Path(rel_path).name}' from '{branch_name}' → main",
+        f"[coordinator] propagated '{Path(file_path).name}' → main (git deferred to SessionEnd)",
         file=sys.stderr,
     )
 
@@ -991,18 +957,18 @@ def handle_pretool(
         _quick_dep_files = (
             crawl_subgraph(file_path, depth=1, conn=conn, direction="forward") - {file_path}
         )
-        stale_nodes = _subgraph_stale(file_path, _quick_dep_files, wt_path, conn)
+        stale_nodes, stale_files = _subgraph_stale(file_path, _quick_dep_files, wt_path, conn)
         if stale_nodes:
-            pulled = _auto_pull_worktree(wt_path, conn, agent_id)
-            if pulled:
+            synced = _sync_from_main(wt_path, stale_files, conn, agent_id)
+            if synced:
                 block(
                     f"Worktree was stale on {stale_nodes} — "
-                    f"auto-rebased onto latest main. Replan with the updated state."
+                    f"synced from main repo. Replan with the updated state."
                 )
             else:
                 block(
-                    f"Worktree stale on {stale_nodes} and auto-rebase conflicted. "
-                    f"Manually resolve conflicts in '{wt_path}', then replan."
+                    f"Worktree stale on {stale_nodes} and sync from main failed. "
+                    f"Check main repo state for '{wt_path}', then replan."
                 )
 
     # 1. Cold cache: ensure target is indexed before any node lookups.
@@ -1228,13 +1194,11 @@ def handle_release(
     update_file(file_path, project_root, conn)
 
     # Worktree auto-push: if the file lives in a registered worktree, commit the
-    # change to the agent's branch and merge it into main before releasing the lock.
-    # This is the guarantee that makes merge conflicts impossible: the lock covers
-    # the full edit → push window, so no other agent can write the same node between
-    # our edit and our merge landing on main.
+    # Propagate the validated edit to the main repo filesystem immediately.
+    # Git compilation is deferred to SessionEnd — no subprocess forks here.
     wt = _get_worktree_for_file(file_path, conn)
     if wt:
-        _auto_commit_and_push(file_path, wt, agent_id, conn)
+        _propagate_to_main(file_path, wt, agent_id, conn)
 
     # Contract validation: re-execute each node and compare structure against snapshot.
     # A superset failure triggers the cascade flow (does not block the original edit).
@@ -1451,16 +1415,19 @@ def handle_session_start(payload: dict, conn: sqlite3.Connection) -> None:
 
 
 def handle_session_end(session_id: str, conn: sqlite3.Connection) -> None:
-    # Squash coordinator micro-commits into one clean commit on main —
+    # Compile all shutil-propagated edits into one clean commit on main —
     # but only if no agent locks are currently held (i.e. it's a true session end,
-    # not a mid-session /compact). If agents are still active, skip the squash so
-    # we don't destroy in-flight work.
+    # not a mid-session /compact). If agents are still active, skip so we don't
+    # commit in-flight work.
     #
-    # NOTE: git reset --soft rewrites local history. This is safe because the
-    # workflow is local-only: changes are pushed to the remote (GitHub) manually
-    # at chosen checkpoints, never automatically during a session. If you ever
-    # add automated remote pushes mid-session, the squash will diverge from
-    # what's already on the remote and require a force-push.
+    # Two cases handled:
+    #   (a) New flow — edits were propagated via shutil.copy2, working tree is dirty,
+    #       no intermediate commits. Stage everything and commit once.
+    #   (b) Legacy flow — micro-commits accumulated (old sessions or mixed state).
+    #       Squash them with reset --soft, then commit as in case (a).
+    #
+    # NOTE: reset --soft rewrites local history. Safe for local-only workflow;
+    # do not add automated remote pushes mid-session without revisiting this.
     active_locks = conn.execute("SELECT COUNT(*) FROM locks").fetchone()[0]
     if active_locks == 0:
         sess = conn.execute(
@@ -1474,14 +1441,20 @@ def handle_session_end(session_id: str, conn: sqlite3.Connection) -> None:
             )
             count = int(count_str.strip()) if count_str.strip().isdigit() else 0
             if count > 1:
+                # Legacy: squash intermediate micro-commits back to baseline.
                 _git(["reset", "--soft", pre_head], cwd=project_root)
+            # Commit any staged/dirty files (shutil-propagated edits land here).
+            _, dirty_out, _ = _git(["status", "--porcelain"], cwd=project_root)
+            if dirty_out.strip():
+                _git(["add", "."], cwd=project_root)
+                label = f" — {count} agent edits" if count > 1 else ""
                 _git(
                     ["commit", "-m",
-                     f"coordinator: session {session_id[:8]} — {count} agent edits"],
+                     f"coordinator: session {session_id[:8]}{label}"],
                     cwd=project_root,
                 )
                 print(
-                    f"[coordinator] squashed {count} micro-commits → 1 on main",
+                    f"[coordinator] session commit: {count} edit(s) squashed → 1 on main",
                     file=sys.stderr,
                 )
         with conn:
