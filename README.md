@@ -263,7 +263,8 @@ The coordinator should classify dependency nodes by type:
 
 This avoids false blocks on trivially non-conflicting edits while maintaining full protection on the nodes where semantic conflicts actually occur. The classification is statically determinable from the AST node type — no LLM needed.
 
-> [!IMPORTANT] Benign nodes do not need to be locked as long as they are not the target of an edit
+> [!IMPORTANT]
+> Benign nodes do not need to be locked as long as they are not the target of an edit
 > edits targeting benign nodes directly will still be blocked when a lock is shared.
 
 ### Cold cache rule
