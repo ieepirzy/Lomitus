@@ -4,7 +4,7 @@
 
 ---
 
->[!NOTE] This repository uses Claude as a comparison and a baseline agentic harness, however the only Claude-specific thing is the schema of the hooks. The concept of hooks exists for all agentic harnesses making this framework harness agnostic with minor revisions.
+> [!NOTE] This repository uses Claude as a comparison and a baseline agentic harness, however the only Claude-specific thing is the schema of the hooks. The concept of hooks exists for all agentic harnesses making this framework harness agnostic with minor revisions.
 
 ## Origin
 
