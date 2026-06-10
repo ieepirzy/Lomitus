@@ -389,14 +389,20 @@ def identify_target_nodes(
 
     matched: set[str] = set()
     for old_string in old_strings:
-        offset = source.find(old_string)
-        if offset == -1:
-            continue
-        edit_line_start = source[:offset].count("\n") + 1
-        edit_line_end   = edit_line_start + old_string.count("\n")
-        for node_id, line_start, line_end in rows:
-            if line_start <= edit_line_end and line_end >= edit_line_start:
-                matched.add(node_id)
+        # Find ALL occurrences to handle non-unique old_strings correctly; for MultiEdit,
+        # later edits may not exist in current source yet (created by an earlier edit in
+        # the same batch) — those are skipped and covered by the first edit's node locks.
+        search_start = 0
+        while True:
+            offset = source.find(old_string, search_start)
+            if offset == -1:
+                break
+            edit_line_start = source[:offset].count("\n") + 1
+            edit_line_end   = edit_line_start + old_string.count("\n")
+            for node_id, line_start, line_end in rows:
+                if line_start <= edit_line_end and line_end >= edit_line_start:
+                    matched.add(node_id)
+            search_start = offset + 1
 
     return list(matched)
 

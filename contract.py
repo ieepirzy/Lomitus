@@ -142,8 +142,8 @@ def args_from_annotations(
 ) -> tuple[list, dict]:
     """
     Construct call arguments from type annotations.
-    Falls back to the "var" placeholder for unannotated params — the executor
-    substitutes None for "var" so the function can still be called.
+    Falls back to _UNRESOLVABLE for unannotated params — _args_repr maps these to None
+    so the function can still be called without a string-sentinel collision.
     """
     args: list[Any] = []
     for arg in func_node.args.args:
@@ -151,11 +151,11 @@ def args_from_annotations(
             continue
         ann = arg.annotation
         if ann is None:
-            args.append("var")
+            args.append(_UNRESOLVABLE)
         elif isinstance(ann, ast.Name) and ann.id in ANNOTATION_DEFAULTS:
             args.append(ANNOTATION_DEFAULTS[ann.id])
         else:
-            args.append("var")
+            args.append(_UNRESOLVABLE)
     return args, {}
 
 
@@ -198,7 +198,7 @@ _SNAPSHOT_SCRIPT = textwrap.dedent("""\
 
 def _args_repr(args: list) -> str:
     """Render args as Python literal expressions for embedding in the snapshot script."""
-    return ", ".join("None" if a == "var" else repr(a) for a in args)
+    return ", ".join("None" if a is _UNRESOLVABLE else repr(a) for a in args)
 
 
 def take_snapshot(

@@ -336,9 +336,9 @@ stderr:
     Dependents requiring update: validate_input(), format_output(), serialize_result().
     Cascade lock acquired. Proceed with updates or revert to restore previous contract.
 
-The cascade task list is ordered by dependency graph topology — outermost dependents
-first, so each node is updated against an already-resolved contract rather than a
-mix of old and new. The coordinator extends the subgraph lock to cover the entire
+The cascade task list is ordered by dependency graph topology — innermost dependents
+(direct callers) first, then transitive dependents, so each node is updated against
+an already-resolved contract rather than a mix of old and new. The coordinator extends the subgraph lock to cover the entire
 cascade set for the duration of the refactor. Any other agent attempting to acquire
 a lock on a node within the cascade subgraph is blocked with the reason:
 

@@ -2,6 +2,7 @@
 #no need to commit local cache during development
 *.db
 *.db-wal
+.claude/coordinator.db*
 .claude/
 # Byte-compiled / optimized / DLL files
 __pycache__/

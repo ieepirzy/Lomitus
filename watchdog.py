@@ -14,12 +14,29 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-DB_PATH      = Path(".claude/coordinator.db")
 POLL_DEFAULT = 10  # seconds
+
+
+def _find_db_path() -> Path:
+    """Locate the coordinator DB in the main repo root, same logic as coordinator.get_db()."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, cwd=str(Path.cwd()),
+        )
+        if result.returncode == 0:
+            common = Path(result.stdout.strip())
+            if not common.is_absolute():
+                common = (Path.cwd() / common).resolve()
+            return common.parent / ".claude" / "coordinator.db"
+    except Exception:
+        pass
+    return Path(".claude/coordinator.db")
 
 
 def _revert_file(file_path: str, source_content: str) -> None:
@@ -27,8 +44,10 @@ def _revert_file(file_path: str, source_content: str) -> None:
 
 
 def _sweep(conn: sqlite3.Connection) -> None:
+    # Only expire locks with an explicit TTL; cascade locks (expires_at IS NULL) are exempt.
     expired = conn.execute(
-        "SELECT node_id, file_path, agent_id FROM locks WHERE expires_at < datetime('now')"
+        "SELECT node_id, file_path, agent_id FROM locks "
+        "WHERE expires_at IS NOT NULL AND expires_at < datetime('now')"
     ).fetchall()
     if not expired:
         return
@@ -54,19 +73,11 @@ def _sweep(conn: sqlite3.Connection) -> None:
             except OSError as e:
                 print(f"watchdog: revert failed for '{file_path}': {e}", file=sys.stderr)
 
-    # Load bloom, remove expired node_ids, save.
-    try:
-        from bloom import load_bloom, save_bloom
-        bloom = load_bloom(conn)
-        for node_id, _, _ in expired:
-            bloom.remove(node_id)
-        save_bloom(conn, bloom)
-    except Exception as e:
-        print(f"watchdog: bloom update failed: {e}", file=sys.stderr)
-
     # Release expired locks and their queue entries.
     with conn:
-        conn.execute("DELETE FROM locks WHERE expires_at < datetime('now')")
+        conn.execute(
+            "DELETE FROM locks WHERE expires_at IS NOT NULL AND expires_at < datetime('now')"
+        )
         for agent_id in agent_ids:
             conn.execute("DELETE FROM lock_queue WHERE agent_id = ?", (agent_id,))
 
@@ -89,12 +100,13 @@ def main() -> None:
         except (IndexError, ValueError):
             pass
 
-    print(f"watchdog: polling '{DB_PATH}' every {interval}s", file=sys.stderr)
+    db_path = _find_db_path()
+    print(f"watchdog: polling '{db_path}' every {interval}s", file=sys.stderr)
 
     while True:
         try:
-            if DB_PATH.exists():
-                conn = sqlite3.connect(str(DB_PATH))
+            if db_path.exists():
+                conn = sqlite3.connect(str(db_path))
                 conn.execute("PRAGMA journal_mode=WAL")
                 _sweep(conn)
                 conn.close()

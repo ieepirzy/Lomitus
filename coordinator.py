@@ -62,10 +62,7 @@ from dep_graph import (
     update_file,
     parse_file,
 )
-from bloom import load_bloom, save_bloom
-from contract import capture_node_snapshot, is_superset, take_snapshot
-
-DB_PATH = Path(".claude/coordinator.db")
+from contract import _UNRESOLVABLE, capture_node_snapshot, is_superset, take_snapshot
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -81,8 +78,9 @@ CREATE TABLE IF NOT EXISTS locks (
     agent_id       TEXT NOT NULL,
     agent_type     TEXT,
     subgraph_hash  TEXT,
-    subgraph_nodes TEXT,
-    acquired_at    TEXT DEFAULT (datetime('now'))
+    subgraph_nodes       TEXT,
+    subgraph_node_hashes TEXT,
+    acquired_at          TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS nodes (
@@ -99,11 +97,6 @@ CREATE TABLE IF NOT EXISTS edges (
     from_file    TEXT NOT NULL,
     to_file      TEXT NOT NULL,
     PRIMARY KEY (from_file, to_file)
-);
-
-CREATE TABLE IF NOT EXISTS bloom_state (
-    id       INTEGER PRIMARY KEY CHECK (id = 1),
-    bitarray BLOB NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS worktrees (
@@ -199,9 +192,18 @@ CREATE INDEX IF NOT EXISTS idx_trav_edges_agent ON agent_traversal_edges(agent_i
 # ---------------------------------------------------------------------------
 
 def get_db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    # Anchor DB to the main repo root so all per-worktree hook processes share one DB.
+    try:
+        cwd = str(Path.cwd())
+        project_root = find_project_root(cwd)
+        main_root = _main_repo_root(project_root)
+    except Exception:
+        main_root = str(Path.cwd())
+    db_path = Path(main_root) / ".claude" / "coordinator.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     _migrate(conn)
     return conn
@@ -250,6 +252,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_wt_events_agent ON worktree_events(agent_id);
         CREATE INDEX IF NOT EXISTS idx_wt_events_path  ON worktree_events(worktree_path);
     """)
+    conn.commit()
+    # v5 → v6: per-node hashes in locks for ownership-aware drift detection.
+    lock_cols = {r[1] for r in conn.execute("PRAGMA table_info(locks)").fetchall()}
+    if "subgraph_node_hashes" not in lock_cols:
+        conn.execute("ALTER TABLE locks ADD COLUMN subgraph_node_hashes TEXT")
     conn.commit()
 
 
@@ -446,7 +453,6 @@ def _expire_stale_locks(conn: sqlite3.Connection) -> None:
         return
 
     reverted_files: set[str] = set()
-    bloom = load_bloom(conn)
 
     for node_id, file_path, agent_id in expired:
         if file_path not in reverted_files:
@@ -467,10 +473,8 @@ def _expire_stale_locks(conn: sqlite3.Connection) -> None:
                     print(f"[coordinator] TTL revert failed for '{file_path}': {e}", file=sys.stderr)
 
         conn.execute("DELETE FROM locks WHERE node_id = ?", (node_id,))
-        bloom.remove(node_id)
 
     conn.commit()
-    save_bloom(conn, bloom)
     print(
         f"[coordinator] TTL: released {len(expired)} expired lock(s), "
         f"reverted {len(reverted_files)} file(s)",
@@ -780,9 +784,7 @@ def _store_snapshot(
     caller_sources: list[str],
     conn: sqlite3.Connection,
 ) -> None:
-    """Take and store an I/O snapshot at lock acquisition (skipped for external nodes)."""
-    if conn.execute("SELECT 1 FROM snapshots WHERE node_id = ?", (node_id,)).fetchone():
-        return  # already snapshotted from a prior lock acquisition
+    """Take a fresh I/O snapshot at each lock acquisition (skipped for external nodes)."""
     kind_row = conn.execute("SELECT kind FROM nodes WHERE node_id = ?", (node_id,)).fetchone()
     if kind_row and kind_row[0] == "external":
         return  # external nodes are not executed
@@ -793,12 +795,12 @@ def _store_snapshot(
     args, io_snap = capture_node_snapshot(file_path, func_name, project_root, caller_sources)
     with conn:
         conn.execute(
-            "INSERT OR IGNORE INTO snapshots "
+            "INSERT OR REPLACE INTO snapshots "
             "(node_id, file_path, source_content, io_snapshot, io_args) "
             "VALUES (?, ?, ?, ?, ?)",
             (node_id, file_path, source_content,
              json.dumps(io_snap) if io_snap is not None else None,
-             json.dumps(args)    if args    is not None else None),
+             json.dumps([None if a is _UNRESOLVABLE else a for a in args]) if args is not None else None),
         )
 
 
@@ -822,7 +824,6 @@ def _cascade_trigger(
     ordered = sorted(all_dep_files, key=lambda f: (f not in direct, f))
 
     cascade_nodes: list[str] = []
-    bloom = load_bloom(conn)
     with conn:
         for dep_file in ordered:
             rows = conn.execute(
@@ -837,18 +838,17 @@ def _cascade_trigger(
                 if existing and existing[0] != agent_id:
                     continue  # locked by another agent — skip, don't block cascade
                 if not existing:
-                    ttl = _compute_ttl(nid, conn)
+                    # Cascade locks have no TTL — the watchdog must not expire them
+                    # mid-refactor. Released via SubagentStop, SessionEnd, or --revert.
                     conn.execute(
                         "INSERT OR IGNORE INTO locks "
                         "(node_id, file_path, agent_id, agent_type, expires_at) "
-                        "VALUES (?, ?, ?, 'cascade', datetime('now', ? || ' seconds'))",
-                        (nid, nfp, agent_id, f"+{ttl}"),
+                        "VALUES (?, ?, ?, 'cascade', NULL)",
+                        (nid, nfp, agent_id),
                     )
-                    bloom.add(nid)
                 cascade_nodes.append(nid)
 
     if cascade_nodes:
-        save_bloom(conn, bloom)
         cascade_id = _uuid.uuid4().hex[:8]
         with conn:
             conn.execute(
@@ -1025,18 +1025,15 @@ def handle_pretool(
     # Record this agent's traversal: nodes targeted + edges followed.
     _record_traversal(agent_id, structural_targets, file_path, dep_files, conn)
 
-    # 4. Conflict check — bloom pre-filter then SQLite confirm.
-    #    Collect all conflicts before blocking so the agent gets the full picture.
-    bloom = load_bloom(conn)
+    # 4. Conflict check — load the full locks table into a dict once.
+    #    Eliminates the lost-update race in the bloom load/modify/save cycle.
+    current_locks: dict[str, str] = dict(conn.execute(
+        "SELECT node_id, agent_id FROM locks"
+    ).fetchall())
 
     def check_locked_by_other(node_id: str) -> str | None:
-        if bloom.might_contain(node_id):
-            row = conn.execute(
-                "SELECT agent_id FROM locks WHERE node_id = ?", (node_id,)
-            ).fetchone()
-            if row and row[0] != agent_id:
-                return row[0]
-        return None
+        holder = current_locks.get(node_id)
+        return holder if holder and holder != agent_id else None
 
     # Check target nodes.
     target_conflicts = [(nid, check_locked_by_other(nid)) for nid in structural_targets]
@@ -1083,6 +1080,16 @@ def handle_pretool(
         ).fetchall()
     ]
     subgraph_hash = compute_merkle_root(all_files, conn)
+    # Per-node hashes for ownership-aware drift detection (v6).
+    if subgraph_node_ids:
+        ph_h, vals_h = _in_clause(subgraph_node_ids)
+        subgraph_node_hashes: dict[str, str] = {
+            r[0]: r[1] for r in conn.execute(
+                f"SELECT node_id, content_hash FROM nodes WHERE node_id IN ({ph_h})", vals_h
+            ).fetchall()
+        }
+    else:
+        subgraph_node_hashes = {}
 
     # 6. Acquire locks — single transaction, all-or-nothing.
     with conn:
@@ -1091,10 +1098,11 @@ def handle_pretool(
             try:
                 conn.execute(
                     "INSERT INTO locks "
-                    "(node_id, file_path, agent_id, agent_type, subgraph_hash, subgraph_nodes, expires_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, datetime('now', ? || ' seconds'))",
+                    "(node_id, file_path, agent_id, agent_type, subgraph_hash, subgraph_nodes, subgraph_node_hashes, expires_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', ? || ' seconds'))",
                     (nid, file_path, agent_id, agent_type,
-                     subgraph_hash, json.dumps(subgraph_node_ids), f"+{ttl}"),
+                     subgraph_hash, json.dumps(subgraph_node_ids),
+                     json.dumps(subgraph_node_hashes), f"+{ttl}"),
                 )
             except sqlite3.IntegrityError:
                 row = conn.execute(
@@ -1106,15 +1114,15 @@ def handle_pretool(
                 # Same agent re-entering: refresh subgraph snapshot and TTL.
                 conn.execute(
                     "UPDATE locks SET subgraph_hash = ?, subgraph_nodes = ?, "
+                    "subgraph_node_hashes = ?, "
                     "expires_at = datetime('now', ? || ' seconds') WHERE node_id = ?",
-                    (subgraph_hash, json.dumps(subgraph_node_ids), f"+{ttl}", nid),
+                    (subgraph_hash, json.dumps(subgraph_node_ids),
+                     json.dumps(subgraph_node_hashes), f"+{ttl}", nid),
                 )
 
-    # 7. Update bloom and dequeue this agent (it's now the lock holder).
+    # 7. Dequeue this agent (it's now the lock holder).
     for nid in structural_targets:
-        bloom.add(nid)
         _dequeue_agent(nid, agent_id, conn)
-    save_bloom(conn, bloom)
 
     # 8. Take I/O snapshots for contract validation at PostToolUse.
     caller_files = crawl_subgraph(file_path, depth=1, conn=conn, direction="reverse") - {file_path}
@@ -1144,57 +1152,85 @@ def handle_release(
     conn: sqlite3.Connection,
     agent_type: str | None = None,
 ) -> None:
+    project_root = find_project_root(file_path)
+
     rows = conn.execute(
-        "SELECT node_id, subgraph_hash, subgraph_nodes FROM locks "
+        "SELECT node_id, subgraph_hash, subgraph_nodes, subgraph_node_hashes FROM locks "
         "WHERE file_path = ? AND agent_id = ?",
         (file_path, agent_id),
     ).fetchall()
 
     if not rows:
-        sys.exit(0)  # idempotent
+        # Lockless edit (benign node — imports, comments, etc.): update cache so node
+        # hashes, line ranges, and edges reflect the new file state.
+        update_file(file_path, project_root, conn)
+        sys.exit(0)
 
-    project_root = find_project_root(file_path)
-    bloom = load_bloom(conn)
+    # Ownership-aware drift check — must run before update_file mutates DB hashes.
+    # Exclude nodes this agent wrote itself (via agent_traversal) to avoid false positives
+    # from the agent's own parallel-batch edits.
+    agent_traversal: set[str] = {r[0] for r in conn.execute(
+        "SELECT node_id FROM agent_traversal_nodes WHERE agent_id = ?", (agent_id,)
+    ).fetchall()}
 
     for row in rows:
-        node_id, stored_hash, subgraph_nodes_json = row
-
-        # Sentinel locks (Write on empty file) carry no subgraph snapshot — no drift
-        # check possible, and none needed: the file was empty, nothing could have drifted.
+        node_id, stored_hash, subgraph_nodes_json, subgraph_node_hashes_json = row
         if _is_sentinel(node_id):
             continue
 
-        stored_nodes = json.loads(subgraph_nodes_json) if subgraph_nodes_json else []
-        recomputed   = compute_merkle_root_from_node_ids(stored_nodes, conn)
+        stored_node_hashes: dict[str, str] = (
+            json.loads(subgraph_node_hashes_json) if subgraph_node_hashes_json else {}
+        )
 
-        #TODO: implement rollback
-        if recomputed != stored_hash:
-            try:
-                raise NotImplementedError("rollback not implemented — v2")
-            except NotImplementedError as e:
-                print(f"Coordinator [v2-stub]: {e}", file=sys.stderr)
-            print(
-                f"Subgraph drifted for '{node_id}': a dependency was mutated during the edit "
-                "window. Edit may be built on stale state. Replan against current dependencies.",
-                file=sys.stderr,
-            )
+        if not stored_node_hashes:
+            # Fallback for lock rows predating v6 (no per-node hashes stored).
+            stored_nodes = json.loads(subgraph_nodes_json) if subgraph_nodes_json else []
+            recomputed   = compute_merkle_root_from_node_ids(stored_nodes, conn)
+            if recomputed != stored_hash:
+                #TODO: implement rollback
+                conn.execute(
+                    "DELETE FROM locks WHERE file_path = ? AND agent_id = ?",
+                    (file_path, agent_id),
+                )
+                conn.commit()
+                print(
+                    f"Subgraph drifted for '{node_id}': a dependency was mutated during the edit "
+                    "window. Edit may be built on stale state. Replan against current dependencies.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            continue
+
+        # Per-node comparison: skip nodes this agent wrote itself.
+        drifted: str | None = None
+        for nid, stored_h in stored_node_hashes.items():
+            if nid in agent_traversal or _is_sentinel(nid):
+                continue
+            curr = conn.execute(
+                "SELECT content_hash FROM nodes WHERE node_id = ?", (nid,)
+            ).fetchone()
+            if curr and curr[0] != stored_h:
+                drifted = nid
+                break
+
+        if drifted:
+            #TODO: implement rollback
             conn.execute(
                 "DELETE FROM locks WHERE file_path = ? AND agent_id = ?",
                 (file_path, agent_id),
             )
             conn.commit()
-            for r in rows:
-                bloom.remove(r[0])
-            save_bloom(conn, bloom)
+            print(
+                f"Subgraph drifted for '{drifted}': a dependency was mutated during the edit "
+                "window. Edit may be built on stale state. Replan against current dependencies.",
+                file=sys.stderr,
+            )
             sys.exit(2)
 
-    # Subgraph is clean — update global cache first, then release lock.
-    # update_file also handles the new-nodes case: if Write added functions to a previously
-    # empty file, they are indexed here and visible to subsequent agents.
+    # Subgraph is clean — update global cache.
     update_file(file_path, project_root, conn)
 
-    # Worktree auto-push: if the file lives in a registered worktree, commit the
-    # Propagate the validated edit to the main repo filesystem immediately.
+    # Worktree auto-push: propagate the validated edit to the main repo filesystem.
     # Git compilation is deferred to SessionEnd — no subprocess forks here.
     wt = _get_worktree_for_file(file_path, conn)
     if wt:
@@ -1202,8 +1238,9 @@ def handle_release(
 
     # Contract validation: re-execute each node and compare structure against snapshot.
     # A superset failure triggers the cascade flow (does not block the original edit).
+    cascade_triggered = False
     for row in rows:
-        node_id, _, _ = row
+        node_id, _, _, _ = row
         if _is_sentinel(node_id):
             continue
         snap_row = conn.execute(
@@ -1222,6 +1259,7 @@ def handle_release(
         if not is_superset(old_snap, new_snap):
             cascade_nodes = _cascade_trigger(file_path, node_id, agent_id, agent_type, conn)
             if cascade_nodes:
+                cascade_triggered = True
                 names = [n.rsplit("::", 1)[-1] for n in cascade_nodes]
                 revert_cmd = (
                     f"echo '{{\"agent_id\": \"{agent_id}\"}}' "
@@ -1241,9 +1279,16 @@ def handle_release(
         (file_path, agent_id),
     )
     conn.commit()
-    for row in rows:
-        bloom.remove(row[0])
-    save_bloom(conn, bloom)
+
+    # Delete snapshots on clean release so TTL/watchdog reverts always restore to the
+    # pre-this-lock state, never older session state.
+    # Exception: keep snapshots when a cascade was triggered — --revert needs them.
+    if not cascade_triggered:
+        for row in rows:
+            node_id = row[0]
+            if not _is_sentinel(node_id):
+                conn.execute("DELETE FROM snapshots WHERE node_id = ?", (node_id,))
+        conn.commit()
 
     # Cascade completion: mark each released node done; emit message if cascade finishes.
     for row in rows:
@@ -1265,22 +1310,11 @@ def handle_release(
 
 def handle_failure(file_path: str, agent_id: str, conn: sqlite3.Connection) -> None:
     """Edit failed — release lock without updating cache. Previous hashes remain valid."""
-    locked_nodes = conn.execute(
-        "SELECT node_id FROM locks WHERE file_path = ? AND agent_id = ?",
-        (file_path, agent_id),
-    ).fetchall()
-
     conn.execute(
         "DELETE FROM locks WHERE file_path = ? AND agent_id = ?",
         (file_path, agent_id),
     )
     conn.commit()
-
-    bloom = load_bloom(conn)
-    for (node_id,) in locked_nodes:
-        bloom.remove(node_id)
-    save_bloom(conn, bloom)
-
     sys.exit(0)
 
 
@@ -1308,8 +1342,6 @@ def handle_revert(payload: dict, conn: sqlite3.Connection) -> None:
         print(f"No active cascade for agent '{agent_id}'.", file=sys.stderr)
         sys.exit(0)
 
-    bloom = load_bloom(conn)
-
     for cascade_id, root_node, cascade_nodes_json in rows:
         cascade_nodes = json.loads(cascade_nodes_json)
         all_nodes = [root_node] + [n for n in cascade_nodes if n != root_node]
@@ -1326,7 +1358,6 @@ def handle_revert(payload: dict, conn: sqlite3.Connection) -> None:
             try:
                 Path(file_path).write_text(source, encoding="utf-8")
                 reverted_files.add(file_path)
-                # Re-index so the cache reflects the reverted content.
                 update_file(file_path, find_project_root(file_path), conn)
             except OSError as e:
                 print(f"Revert write failed for '{file_path}': {e}", file=sys.stderr)
@@ -1338,7 +1369,6 @@ def handle_revert(payload: dict, conn: sqlite3.Connection) -> None:
                     "DELETE FROM locks WHERE node_id = ? AND agent_id = ?",
                     (nid, agent_id),
                 )
-                bloom.remove(nid)
             conn.execute(
                 "UPDATE cascades SET status = 'reverted' WHERE cascade_id = ?",
                 (cascade_id,),
@@ -1351,7 +1381,6 @@ def handle_revert(payload: dict, conn: sqlite3.Connection) -> None:
             file=sys.stderr,
         )
 
-    save_bloom(conn, bloom)
     sys.exit(0)
 
 
@@ -1361,17 +1390,9 @@ def handle_revert(payload: dict, conn: sqlite3.Connection) -> None:
 
 def _release_agent_locks(agent_id: str, conn: sqlite3.Connection) -> None:
     """Release all locks and queue entries held by agent_id (no cache update)."""
-    locked = conn.execute(
-        "SELECT node_id FROM locks WHERE agent_id = ?", (agent_id,)
-    ).fetchall()
     conn.execute("DELETE FROM locks WHERE agent_id = ?", (agent_id,))
     conn.execute("DELETE FROM lock_queue WHERE agent_id = ?", (agent_id,))
     conn.commit()
-    if locked:
-        bloom = load_bloom(conn)
-        for (nid,) in locked:
-            bloom.remove(nid)
-        save_bloom(conn, bloom)
 
 
 def _warm_from_file(file_path: str, depth: int, project_root: str, conn: sqlite3.Connection) -> None:
@@ -1460,15 +1481,9 @@ def handle_session_end(session_id: str, conn: sqlite3.Connection) -> None:
         with conn:
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
 
-    locked = conn.execute("SELECT node_id FROM locks").fetchall()
     conn.execute("DELETE FROM locks")
     conn.execute("DELETE FROM agents WHERE session_id = ?", (session_id,))
     conn.commit()
-    if locked:
-        bloom = load_bloom(conn)
-        for (nid,) in locked:
-            bloom.remove(nid)
-        save_bloom(conn, bloom)
     conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
     sys.exit(0)
 
@@ -1986,7 +2001,7 @@ def handle_worktree_remove(payload: dict, conn: sqlite3.Connection) -> None:
     if main_root:
         _git(["worktree", "remove", "--force", worktree_path], cwd=main_root)
         if delete_branch and branch_name:
-            _git(["branch", "-d", branch_name], cwd=main_root)
+            _git(["branch", "-D", branch_name], cwd=main_root)
 
     _log_worktree_event(
         "remove", worktree_path, conn,
@@ -2003,29 +2018,57 @@ def handle_worktree_remove(payload: dict, conn: sqlite3.Connection) -> None:
 
 def handle_post_tool_batch(payload: dict, conn: sqlite3.Connection) -> None:
     """
+    NOTE: PostToolBatch is NOT a registerable hook event in the current Claude Code CLI.
+    The settings.json schema validator rejects it with "Not a recognized hook event".
+    This handler must be invoked manually if needed. Fallback: per-node drift is also
+    caught at each individual PostToolUse in handle_release.
+
     Fires after a parallel batch of tool calls resolves, before the next model call.
-    Re-validates the Merkle root of every subgraph snapshot held by this agent.
-    If any dependency shifted during the batch window, block and report drift so
-    the agent replans against the current state.
+    Re-validates subgraph snapshots held by this agent using ownership-aware comparison:
+    hash deltas on nodes written by this agent in the same batch are excluded so the
+    agent's own parallel edits don't false-positive as drift.
     """
     agent_id = payload.get("agent_id") or payload.get("session_id", "unknown")
 
     rows = conn.execute(
-        "SELECT node_id, file_path, subgraph_hash, subgraph_nodes FROM locks "
+        "SELECT node_id, file_path, subgraph_hash, subgraph_nodes, subgraph_node_hashes FROM locks "
         "WHERE agent_id = ? AND subgraph_hash IS NOT NULL",
         (agent_id,),
     ).fetchall()
 
+    agent_traversal: set[str] = {r[0] for r in conn.execute(
+        "SELECT node_id FROM agent_traversal_nodes WHERE agent_id = ?", (agent_id,)
+    ).fetchall()}
+
     drift_nodes: list[str] = []
-    for node_id, _file_path, stored_hash, subgraph_nodes_json in rows:
+    for node_id, _file_path, stored_hash, subgraph_nodes_json, subgraph_node_hashes_json in rows:
         if _is_sentinel(node_id):
             continue
-        stored_nodes = json.loads(subgraph_nodes_json) if subgraph_nodes_json else []
-        if not stored_nodes:
+
+        stored_node_hashes: dict[str, str] = (
+            json.loads(subgraph_node_hashes_json) if subgraph_node_hashes_json else {}
+        )
+
+        if not stored_node_hashes:
+            # Fallback to Merkle root comparison for pre-v6 lock rows.
+            stored_nodes = json.loads(subgraph_nodes_json) if subgraph_nodes_json else []
+            if not stored_nodes:
+                continue
+            recomputed = compute_merkle_root_from_node_ids(stored_nodes, conn)
+            if recomputed != stored_hash:
+                drift_nodes.append(node_id.rsplit("::", 1)[-1])
             continue
-        recomputed = compute_merkle_root_from_node_ids(stored_nodes, conn)
-        if recomputed != stored_hash:
-            drift_nodes.append(node_id.rsplit("::", 1)[-1])
+
+        # Per-node comparison: skip nodes this agent wrote itself.
+        for nid, stored_h in stored_node_hashes.items():
+            if nid in agent_traversal or _is_sentinel(nid):
+                continue
+            curr = conn.execute(
+                "SELECT content_hash FROM nodes WHERE node_id = ?", (nid,)
+            ).fetchone()
+            if curr and curr[0] != stored_h:
+                drift_nodes.append(node_id.rsplit("::", 1)[-1])
+                break
 
     if drift_nodes:
         print(
@@ -2086,52 +2129,59 @@ def main() -> None:
             block("Coordinator error: DB unavailable.")
         sys.exit(0)
 
-    if mode == "revert":
-        handle_revert(payload, conn)
-    elif mode == "pretool":
-        file_path, agent_id, agent_type, session_id, tool_name, tool_input = extract_context(payload)
-        empty_path = str(Path("").resolve())
-        if not file_path or file_path == empty_path:
-            sys.exit(0)
-        handle_pretool(file_path, agent_id, agent_type, tool_name, tool_input, conn)
-    elif mode == "release":
-        file_path, agent_id, agent_type, *_ = extract_context(payload)
-        handle_release(file_path, agent_id, conn, agent_type)
-    elif mode == "failure":
-        file_path, agent_id, *_ = extract_context(payload)
-        handle_failure(file_path, agent_id, conn)
-    elif mode == "session_start":
-        handle_session_start(payload, conn)
-    elif mode == "session_end":
-        handle_session_end(payload.get("session_id", ""), conn)
-    elif mode == "subagent_start":
-        handle_subagent_start(payload, conn)
-    elif mode == "subagent_stop":
-        handle_subagent_stop(payload, conn)
-    elif mode == "file_changed":
-        handle_file_changed(payload, conn)
-    elif mode == "cwd_changed":
-        handle_cwd_changed(payload, conn)
-    elif mode == "crawl_project":
-        handle_crawl_project(payload, conn)
-    elif mode == "worktree_create_hook":
-        handle_worktree_create_hook(payload, conn)
-    elif mode == "worktree_create":
-        handle_worktree_create(payload, conn)
-    elif mode == "worktree_push":
-        handle_worktree_push(payload, conn)
-    elif mode == "worktree_pull":
-        handle_worktree_pull(payload, conn)
-    elif mode == "worktree_status":
-        handle_worktree_status(payload, conn)
-    elif mode == "worktree_log":
-        handle_worktree_log(payload, conn)
-    elif mode == "worktree_remove":
-        handle_worktree_remove(payload, conn)
-    elif mode == "post_tool_batch":
-        handle_post_tool_batch(payload, conn)
-    elif mode == "pre_compact":
-        handle_pre_compact(conn)
+    try:
+        if mode == "revert":
+            handle_revert(payload, conn)
+        elif mode == "pretool":
+            file_path, agent_id, agent_type, session_id, tool_name, tool_input = extract_context(payload)
+            empty_path = str(Path("").resolve())
+            if not file_path or file_path == empty_path:
+                sys.exit(0)
+            handle_pretool(file_path, agent_id, agent_type, tool_name, tool_input, conn)
+        elif mode == "release":
+            file_path, agent_id, agent_type, *_ = extract_context(payload)
+            handle_release(file_path, agent_id, conn, agent_type)
+        elif mode == "failure":
+            file_path, agent_id, *_ = extract_context(payload)
+            handle_failure(file_path, agent_id, conn)
+        elif mode == "session_start":
+            handle_session_start(payload, conn)
+        elif mode == "session_end":
+            handle_session_end(payload.get("session_id", ""), conn)
+        elif mode == "subagent_start":
+            handle_subagent_start(payload, conn)
+        elif mode == "subagent_stop":
+            handle_subagent_stop(payload, conn)
+        elif mode == "file_changed":
+            handle_file_changed(payload, conn)
+        elif mode == "cwd_changed":
+            handle_cwd_changed(payload, conn)
+        elif mode == "crawl_project":
+            handle_crawl_project(payload, conn)
+        elif mode == "worktree_create_hook":
+            handle_worktree_create_hook(payload, conn)
+        elif mode == "worktree_create":
+            handle_worktree_create(payload, conn)
+        elif mode == "worktree_push":
+            handle_worktree_push(payload, conn)
+        elif mode == "worktree_pull":
+            handle_worktree_pull(payload, conn)
+        elif mode == "worktree_status":
+            handle_worktree_status(payload, conn)
+        elif mode == "worktree_log":
+            handle_worktree_log(payload, conn)
+        elif mode == "worktree_remove":
+            handle_worktree_remove(payload, conn)
+        elif mode == "post_tool_batch":
+            handle_post_tool_batch(payload, conn)
+        elif mode == "pre_compact":
+            handle_pre_compact(conn)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        if mode == "pretool":
+            block(f"Coordinator error: {exc}")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
