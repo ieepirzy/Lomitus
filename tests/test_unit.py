@@ -19,7 +19,6 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from bloom import load_bloom
 from contract import (
     args_from_annotations,
     extract_literal_args,

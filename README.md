@@ -7,6 +7,9 @@
 > [!NOTE]
 >  This repository uses Claude as a comparison and a baseline agentic harness, however the only Claude-specific thing is the schema of the hooks. The concept of hooks exists for all agentic harnesses making this framework harness agnostic with minor revisions.
 
+> [!NOTE]
+> **Language scope:** The coordinator currently supports Python only. `_is_python()` guard in `handle_pretool()` passes non-Python files through uncoordinated. TypeScript/JavaScript dep graph integration (madge, dependency-cruiser) is a planned extension.
+
 ## Origin
 
 The insight that started this came during a drive. Approaching a roundabout, the coordination problem became suddenly obvious: multiple cars, shared nodes, priority rules, no central dispatcher. Traffic works because every agent follows a local rule set that produces globally consistent behavior. The question that followed was: why don't coding agents do the same thing?
@@ -39,15 +42,15 @@ The coordinator implements CBS-style runtime coordination. Static subgraph decom
 
 ## Architecture Overview
 
-The coordinator is a deterministic service integrated into the agents harness. It lives next to Claude Code as a local Python script, invoked via Claude Code's PreToolUse and PostToolUse, and other hook mechanism. No LLM is in the coordination path — coordination is a graph algorithm problem, not a reasoning problem. Making the coordinator another AI would introduce nondeterminism exactly where you need guarantees.
+The coordinator is a deterministic service integrated into the agents harness. It lives next to Claude Code as a local Python script, invoked via Claude Code's PreToolUse and PostToolUse, and other hook mechanisms. No LLM is in the coordination path — coordination is a graph algorithm problem, not a reasoning problem. Making the coordinator another AI would introduce nondeterminism exactly where you need guarantees.
 
 The full architecture is versioned:
 
-| Version | Capability |
-|---------|------------|
-| v0 | File-level lock, PreToolUse hook blocks conflicting writes |
-| v1 | Subgraph lock, dep graph integration, bloom filter, subgraph hash |
-| v2 | I/O contract from call sites, subset validation, preclaim consensus, TTL revert |
+| Version | Capability | Status |
+|---------|------------|--------|
+| v0 | File-level lock, PreToolUse hook blocks conflicting writes | Implemented |
+| v1 | Method-level subgraph lock, dep graph integration, subgraph Merkle hash | Implemented |
+| v2 | I/O contract from call sites, open-world superset validation, cascade flow, TTL revert | Implemented |
 
 ---
 
@@ -69,6 +72,10 @@ The hook receives tool context as JSON on stdin. Exit 0 allows the tool call. Ex
     "PostToolUse": [{
       "matcher": "Edit|Write|MultiEdit",
       "hooks": [{"type": "command", "command": "python /path/to/coordinator.py --release"}]
+    }],
+    "PostToolUseFailure": [{
+      "matcher": "Edit|Write|MultiEdit",
+      "hooks": [{"type": "command", "command": "python /path/to/coordinator.py --failure"}]
     }]
   }
 }
@@ -150,7 +157,7 @@ The lock table key changes from `file_path` (v0) to `node_id` — a `"abs_path::
 ```sql
 CREATE TABLE IF NOT EXISTS locks (
     node_id        TEXT PRIMARY KEY,   -- "abs_path::function_name" or "abs_path::__file__"
-    file_path      TEXT NOT NULL,      -- denormalised for bloom filter and batch release
+    file_path      TEXT NOT NULL,      -- denormalised for batch release queries
     agent_id       TEXT NOT NULL,
     agent_type     TEXT,
     subgraph_hash  TEXT,               -- Merkle root at acquisition time
@@ -161,17 +168,32 @@ CREATE TABLE IF NOT EXISTS locks (
 
 The `abs_path::__file__` sentinel is used when the Write tool targets a file with no existing structural nodes (empty or brand-new file), giving the first writer an exclusive file-level lock until the file has content.
 
+### Conflict check implementation
+
+The coordinator loads the full locks table into a Python dict at PreToolUse:
+
+```python
+current_locks: dict[str, str] = dict(conn.execute(
+    "SELECT node_id, agent_id FROM locks"
+).fetchall())
+```
+
+A single read of all locks avoids TOCTOU races from concurrent acquisitions. At typical session scales (dozens of agents, hundreds of locked nodes), this is cheaper than per-node SQLite queries.
+
 ### Dependency graph
 
-Existing tooling handles most of the static graph construction:
+The coordinator builds its own dependency graph via static AST analysis (`dep_graph.py`). No third-party graph tools are required. Nodes are method-level:
 
-- Python: `pydep`, `modulegraph`
-- TypeScript/JavaScript: `madge`, `dependency-cruiser`
+- `abs_path::function_name` — module-level `def` and `async def` functions
+- `abs_path::ClassName.method_name` — class methods (`def` and `async def`), both sync and async treated identically
+- `abs_path::N` (line number) — module-level non-function statements (imports, variable declarations, bare expressions)
+
+`async def` is a first-class node type, not a special case. Classification (`structural | external | benign`) and locking apply identically to sync and async callables. Edges are cross-file import relationships within the project.
 
 Graph invalidation is asymmetric, which matters for performance:
 
 - **Adds** (new files, new imports): append and branch. The existing graph stays valid, new edges extend it. Cheap, common case.
-- **Deletes**: force full recalculation. A node disappearing can orphan dependents or collapse a subgraph. Structurally destructive.
+- **Deletes**: force re-indexing of dependent files. A node disappearing can orphan dependents or collapse a subgraph. Structurally destructive.
 
 ### Subgraph hash
 
@@ -181,17 +203,11 @@ Graph invalidation is asymmetric, which matters for performance:
 
 This is environment drift detection: not "what did this agent change" but "did the world this agent was reasoning from shift under it."
 
-Note: this means that agents only claim relevant parts of the subgraph on the acting turn, which triggers the validation steps before being accepted.
-
 Edits that add new methods or files will trigger graph extensions and crawling PostToolUse.
 
-### Bloom filter
+### Ownership-aware drift detection
 
-In large codebases, a dependency subgraph can contain thousands of nodes. Checking each against SQLite individually before acquiring a subgraph lock is wasteful. A bloom filter sits in front of the DB as a pre-check: nodes that are definitely not locked are skipped, only candidates hit SQLite. False positives just mean an unnecessary DB lookup, which is acceptable. False negatives are impossible by construction.
-
-This is useful when the coordinator is checking if any dependencies have currently got locks on them.
-
-For v0 with single-file locking, the bloom filter adds nothing — one primary key lookup is already optimal. It earns its place at subgraph scale.
+When multiple agents are working in parallel, a naive Merkle comparison would incorrectly flag an agent's own earlier writes as external drift. The coordinator tracks each agent's traversal (nodes targeted, edges followed) in `agent_traversal_nodes` and `agent_traversal_edges` tables. At PostToolUse drift check, nodes the agent itself wrote are excluded from the comparison, preventing false positives on parallel batch edits.
 
 ### Lazy cache population
 
@@ -206,9 +222,7 @@ When an agent's PreToolUse fires, the coordinator checks the 1-edge subgraph aga
 
 A global state is kept consistent even when agents are working in different git worktrees by utilizing git commands. Each agent's worktree has its own filesystem view; the coordinator normalises all paths to canonical project-root-relative keys and uses git to read file state from the authoritative tree rather than from a specific worktree's working copy.
 
-Exploratory tool use hooks are distinct from RW tool use hooks, this allows for different crawling depths based on the anticipated action.
-
-An existing conceptual limitation is deeply nested dynamic imports ex. `importlib.import_module()` where the target is a variable. Static AST crawl cannot resolve these cases.
+An existing conceptual limitation is deeply nested dynamic imports e.g. `importlib.import_module()` where the target is a variable. Static AST crawl cannot resolve these cases.
 
 ### Worktree state vs. global cache
 
@@ -222,19 +236,20 @@ Beyond write-time crawling, Claude Code exposes hooks that allow the coordinator
 
 | Hook | Coordinator use |
 |------|----------------|
-| `SessionStart` | Initialize coordinator DB for the session |
-| `SubagentStart` | Register agent, record worktree assignment, begin tracking |
+| `SessionStart` | Initialize coordinator DB, run initial cache warm |
+| `SubagentStart` | Register agent identity and priority tier, begin tracking |
 | `SubagentStop` | Deregister agent, release any remaining locks held by that agent |
 | `WorktreeCreate` | Record worktree↔agent mapping, used for path normalization |
 | `WorktreeRemove` | Clean up worktree mapping, trigger final lock release for that worktree |
 | `FileChanged` | File mutated in a worktree — crawl subgraph from that file, update global cache |
 | `CwdChanged` | Agent navigated to new directory — crawl 2-3 edges from new context, warm cache |
-| `PostToolBatch` | After a parallel batch of tool calls resolves — validate batch as a unit before next model call, useful if an agent fires multiple edits in parallel |
 | `PreToolUse` | **Primary enforcement point** — lock acquisition and drift check before any write |
 | `PostToolUse` | **Primary release point** — cache update and lock release after write completes |
 | `PostToolUseFailure` | Edit failed — release lock without updating cache, leave previous hash intact |
-| `PreCompact` | Snapshot coordinator state before context compaction in case of post-compact replanning |
-| `SessionEnd` | Final cleanup, release all remaining locks, persist cache to disk |
+| `PreCompact` | Checkpoint WAL before context compaction |
+| `SessionEnd` | Final cleanup, squash intermediate micro-commits, release all remaining locks |
+
+> **Note:** `PostToolBatch` is **not** a registerable hook event in the current Claude Code CLI. The coordinator has a `--post-tool-batch` handler for manual or future use, but it cannot be wired up via `.claude/settings.json` today.
 
 Hooks not listed (`UserPromptSubmit`, `Notification`, `Stop`, etc.) have no coordinator relevance.
 
@@ -256,7 +271,7 @@ The race condition means the coordinator cannot guarantee that agent B's *reason
 
 Not all dependency collisions warrant blocking. Import statements and module-level variable declarations are shared dependencies — every method in a file implicitly depends on them — but edits to them are typically additive and low-risk. Two agents both importing a new module from the same file do not conflict in any meaningful sense.
 
-The coordinator should classify dependency nodes by type:
+The coordinator classifies dependency nodes by type:
 
 - **Structural nodes** (method definitions, class definitions): full lock enforcement, no concurrent writes.
 - **Benign nodes** (import statements, module-level variable declarations): collision allowed, concurrent writes permitted, hash still tracked for drift detection.
@@ -264,8 +279,8 @@ The coordinator should classify dependency nodes by type:
 This avoids false blocks on trivially non-conflicting edits while maintaining full protection on the nodes where semantic conflicts actually occur. The classification is statically determinable from the AST node type — no LLM needed.
 
 > [!IMPORTANT]
-> Benign nodes do not need to be locked as long as they are not the target of an edit
-> edits targeting benign nodes directly will still be blocked when a lock is shared.
+> Benign nodes do not need to be locked as long as they are not the target of an edit.
+> Edits targeting benign nodes directly will still be blocked when a lock is shared.
 
 ### Cold cache rule
 
@@ -277,7 +292,13 @@ The cost is acceptable: it happens once per node per session, and only for nodes
 
 ### Dual-use AST cache
 
-The same parse and crawl serves both subgraph hash comparison (drift detection) and I/O contract validation. The expensive part — parsing — happens once per node per session. Two consumers, one cache. Allowed writes, that is, writes that pass the pre and post tool use hooks for the editing agent, which ensures consistency (see below), then overwrite the previous hash. 
+The same parse and crawl serves both subgraph hash comparison (drift detection) and I/O contract validation. The expensive part — parsing — happens once per node per session. Two consumers, one cache. Allowed writes, that is, writes that pass the pre and post tool use hooks for the editing agent, which ensures consistency (see below), then overwrite the previous hash.
+
+### Priority queue
+
+A `lock_queue` table holds requests that arrive while a target node is already locked. Priority tiers are stored in the `agents` table (`orchestrator=100`, `senior/lead=80`, default=0). Queued agents are processed in priority order when the lock is released.
+
+> **Known gap — classical deadlock:** The priority queue provides ordering but has no cycle detection. Agent A holding `foo()` and needing `bar()` while Agent B holds `bar()` and needs `foo()` will deadlock permanently. See [OPEN TODOs](#open-todos) for the suggested fix.
 
 ---
 
@@ -302,12 +323,14 @@ The protocol:
 **At lock acquisition:**
 1. Crawl one edge up the dep graph to find direct callers of the target method
 2. Extract a real input from an actual call site (literal arguments, or constructed from type annotations via AST)
-3. Execute the method with that input, snapshot the output *structure* — shape and types, not exact values
+3. Execute the method with that input in a subprocess, snapshot the output *structure* — shape and types, not exact values
 4. Store the snapshot alongside the lock in SQLite
 
 **At write time:**
 1. Re-execute the method with the same input
 2. Validate the new output is a *superset* of the snapshotted structure
+
+**Argument resolution order:** literal call sites are tried first. If none found, type annotations are used (`int → 0`, `str → ""`, etc.). If a parameter has no annotation or a complex type that isn't a known scalar, it is substituted with `None` at execution time. If the subprocess returns non-zero or times out (5s default), the snapshot is `None` — contract validation is silently skipped for that node. External nodes (functions that call `requests`, `anthropic`, `psycopg2`, etc.) are skipped entirely.
 
 ### Open-world validation
 
@@ -342,7 +365,7 @@ an already-resolved contract rather than a mix of old and new. The coordinator e
 cascade set for the duration of the refactor. Any other agent attempting to acquire
 a lock on a node within the cascade subgraph is blocked with the reason:
 
-    Cascade refactor in progress on mutate_data() by agent .
+    Cascade refactor in progress on mutate_data() by agent <id>.
     Affected subgraph is locked until cascade completes or reverts.
 
 The agent may revert at any point before the cascade completes. Revert triggers
@@ -362,7 +385,13 @@ and in the right order.
 
 Classical deadlock: Agent A holds a lock on `foo()` and needs `bar()`. Agent B holds `bar()` and needs `foo()`. Both wait forever.
 
-The solution maps directly to classical DB concurrency control — wound-wait or wait-die — because this is the same problem class. Before acquiring a lock, the agent broadcasts its intent. The coordinator checks the current lock graph for cycles. On cycle detected, rather than waiting, the coordinator negotiates a swap: agents trade their locked resources and proceed from the other's position. This is O(n) space to track agent intent, O(n²) worst case for cycle detection, but n (number of concurrent agents) is small in practice.
+The priority queue provides ordering when agents queue for the same node, but it does not detect cycles across distinct nodes. Classical deadlock (A→B→A in the lock-wait graph) is a known gap. The suggested fix is wound-wait:
+
+1. Add an `agent_intents` table. At PreToolUse, before acquiring a lock, write the target `node_id` as an intent.
+2. On each lock acquisition attempt, BFS the `(node_id → agent_id → intents)` graph for cycles.
+3. On cycle detected, wound the lower-priority agent: release its held locks, requeue it, allow the higher-priority agent to proceed.
+
+This is O(n) space for intent tracking, O(n²) worst case for cycle detection, where n is the number of concurrent agents — small in practice.
 
 ### Crash recovery — TTL revert
 
@@ -370,20 +399,19 @@ If an agent crashes mid-edit, its PostToolUse hook never fires. The lock is neve
 
 On TTL expiry — where TTL scales with method line count as a heuristic for expected edit duration — the coordinator does not merely release the lock. It first reverts the file to the pre-lock snapshot (already stored for the I/O contract check), then releases. A crashed agent leaves zero damage. The codebase is in a known-good state.
 
+TTL enforcement runs inline at PreToolUse (`_expire_stale_locks()`). The watchdog process (`watchdog.py`) provides a parallel sweep on a configurable polling interval (default 10s) as a belt-and-suspenders fallback for sessions where PreToolUse is not frequently firing.
+
 The system makes no runtime guarantees of correctness. Revert-on-TTL is the correct conservative default: deterministic, safe, and leaves a clear audit trail.
 
 ## Worktree Merge Guarantee & Merkle Optimization
 
 When a blocked agent is given the green light to re-attempt an edit after pulling
 in changes from main, the resulting `git merge` into its worktree is guaranteed to
-be clean. This is not an optimistic assumption — it is a logical consequence of the
-hash-based staleness detection. Because CBS blocks any edit applied against an
-outdated dependency snapshot, by the time an agent holds a subgraph lock and
-proceeds to write, its view of the dependency graph is current by definition.
-Sequential writes to any given subgraph are enforced by the lock, so git has no
-grounds for a textual conflict on locked nodes. The only conceivable conflicts would
-be cosmetic and outside the dependency graph entirely (whitespace, line endings),
-which are not CBS concerns.
+be clean **for CBS-managed files**. This is a logical consequence of the hash-based staleness detection: because CBS blocks any edit applied against an outdated dependency snapshot, by the time an agent holds a subgraph lock and proceeds to write, its view of the dependency graph is current by definition. Sequential writes to any given subgraph are enforced by the lock, so git has no grounds for a textual conflict on locked nodes.
+
+The only conceivable conflicts would be cosmetic and outside the dependency graph entirely (whitespace, line endings), which are not CBS concerns.
+
+> **Implementation note:** On PostToolUse success for worktree files, validated edits are propagated to the main repo immediately via `shutil.copy2()` — no git involved at that step. Git operations are deferred to `SessionEnd`, where intermediate micro-commits are squashed into a single commit. The `--worktree-push` path executes a real `git merge --no-ff` and can still fail on non-CBS-managed changes (e.g., files the agents modified outside coordinator hooks). That failure path is the agent's responsibility to resolve.
 
 As an optimization, agents do not need to query every individual node hash before
 acquiring a lock. Instead, a Merkle root over the dependency subgraph serves as a
@@ -407,10 +435,202 @@ The LLMs do the actual code work. The coordinator does assignment and collision 
 ## Complexity Estimate
 
 - v0: ~100 LOC Python. An afternoon.
-- v1: MSc or large project tier for a pragmatic Python + TS implementation. The dep graph integration and subgraph hashing are the bulk of the work.
-- v2: Approaches PhD territory only if targeting formal correctness guarantees across arbitrary languages. For pragmatic Python + TS with open-world validation and heuristic TTL, it stays at MSc or comparable level.
+- v1: MSc or large project tier for a pragmatic Python implementation. The dep graph integration and subgraph hashing are the bulk of the work. **Implemented** (~2200 LOC Python total).
+- v2: Approaches PhD territory only if targeting formal correctness guarantees across arbitrary languages. For pragmatic Python with open-world validation and heuristic TTL, it stays at MSc or comparable level. **Implemented** (cascade flow, TTL revert, watchdog, worktree management all functional).
 
 The integration of runtime agent coordination, partial AST rollback, live dep graph, and I/O contract validation from real call sites is novel relative to the current ecosystem. No existing multi-agent coding framework implements this combination.
+
+---
+
+## Production Operation
+
+### Prerequisites
+
+- Python 3.11+. No third-party runtime dependencies.
+- `pygit2` is optional — the coordinator falls back to `git` subprocess calls when it is not installed.
+- All git operations are local. The coordinator runs fully offline. Network access is only required by the user code executed in contract snapshot subprocesses, and those degrade gracefully to `None` on failure.
+
+### Installation
+
+1. Clone this repository alongside your project, or copy `coordinator.py`, `dep_graph.py`, `contract.py`, and `watchdog.py` into a stable path.
+2. Configure `.claude/settings.json` in your project root.
+3. Optionally start `watchdog.py` as a background process for TTL enforcement independent of hook cadence.
+
+### settings.json — full production configuration
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py --session-start"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py --session-end"}]}],
+    "SubagentStart": [{"hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py --subagent-start"}]}],
+    "SubagentStop": [{"hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py --subagent-stop"}]}],
+    "WorktreeCreate": [{"hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py --worktree-create-hook"}]}],
+    "WorktreeRemove": [{"hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py --worktree-remove"}]}],
+    "FileChanged": [{"hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py --file-changed"}]}],
+    "CwdChanged": [{"hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py --cwd-changed"}]}],
+    "PreCompact": [{"matcher": "manual|auto", "hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py --pre-compact"}]}],
+    "PreToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py"}]}],
+    "PostToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py --release"}]}],
+    "PostToolUseFailure": [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command",
+      "command": "python /path/to/coordinator.py --failure"}]}]
+  }
+}
+```
+
+### CLI reference
+
+All modes read JSON from stdin (the Claude Code hook payload format).
+
+| Flag | Hook event | Description |
+|------|------------|-------------|
+| *(none)* | `PreToolUse` | Lock acquisition, drift check, contract snapshot |
+| `--release` | `PostToolUse` | Drift recheck, cache update, lock release |
+| `--failure` | `PostToolUseFailure` | Silent lock release, no cache update |
+| `--session-start` | `SessionStart` | Initialize DB schema, optional project crawl |
+| `--session-end` | `SessionEnd` | Final cleanup, squash micro-commits, release all locks |
+| `--subagent-start` | `SubagentStart` | Register agent identity and priority |
+| `--subagent-stop` | `SubagentStop` | Deregister agent, release all its locks |
+| `--worktree-create-hook` | `WorktreeCreate` | Register new worktree↔agent mapping |
+| `--worktree-remove` | `WorktreeRemove` | Remove worktree mapping, release agent locks |
+| `--file-changed` | `FileChanged` | Re-index changed file, update cache (2-3 edge crawl) |
+| `--cwd-changed` | `CwdChanged` | Warm cache from new working directory |
+| `--pre-compact` | `PreCompact` | WAL checkpoint before context compaction |
+| `--crawl-project` | Manual / SessionStart | Recursively index all `.py` files under project root |
+| `--revert` | Manual / cascade | Revert all files in a cascade set to pre-lock snapshots |
+| `--worktree-create` | Manual | Create a git worktree + branch for an agent |
+| `--worktree-push` | Manual | Merge agent branch → main, re-index changed files |
+| `--worktree-pull` | Manual | Rebase agent worktree onto latest main |
+| `--worktree-status` | Manual | Report live status of all registered worktrees (JSON stdout) |
+| `--worktree-log` | Manual | Query worktree event log (JSON stdout) |
+| `--post-tool-batch` | Manual | Batch drift check (not a registerable hook event in Claude Code CLI) |
+
+### Watchdog
+
+`watchdog.py` runs alongside the coordinator for the duration of a session. It polls the locks table for expired TTLs, reverts files from snapshots, and marks in-progress cascades as reverted for any agent that crashed.
+
+```bash
+python watchdog.py                      # default: poll every 10s
+python watchdog.py --poll-interval 5    # custom interval
+```
+
+The watchdog is standalone (stdlib only) and reads the same `coordinator.db` that the hook invocations write.
+
+---
+
+## OPEN TODOs
+
+### External call classification
+
+`contract.py` and `dep_graph.py` classify nodes as "external" (skip contract snapshot) by checking whether the function body calls any module in a hardcoded prefix set (`requests`, `openai`, `psycopg2`, etc.). This does not answer the real question: *does the call graph of this specific function reach a node with observable side effects at execution time?*
+
+The current approach has false positives (functions that import `requests` but never use it in the relevant code path) and false negatives (functions that call user-defined wrappers around network calls).
+
+**Suggested fix:** implement effect typing — classify nodes as `pure | io | network | db | ...` and propagate the classification transitively through the call graph. A pure function calling an io function is io. The coordinator already has the call graph; effect propagation is a DFS over it.
+
+### Structural isolation before snapshot execution
+
+`contract.py` executes the target function by importing the module directly in a subprocess. Any module-level code with side effects (initializing a DB connection pool, registering signal handlers, spawning a thread) runs on import and can cause the snapshot subprocess to hang, crash, or produce wrong output.
+
+**Suggested fix:** use `ast.NodeTransformer` to strip or stub any top-level statements that aren't `def`, `async def`, or `class` definitions before writing the rewritten source to the snapshot interpreter. This prevents accidental initialization loops from ever reaching the execution step.
+
+### Synthetic mocks for complex types
+
+When argument resolution falls back to type annotations, only scalar types (`int`, `str`, `bool`, etc.) produce working default values. Parameters annotated with complex types (dataclasses, Pydantic models, SQLAlchemy ORM objects) fall back to `None`, which often causes the subprocess snapshot to fail and return `None` — silently skipping contract validation.
+
+**Suggested fix:** when an annotation name is not a known scalar, query the `nodes` table for a `ClassDef` with that name. If found, read its `__init__` fields and construct a lightweight mock object with those fields set to their own defaults. `__getattr__` fallback to `None` prevents `AttributeError` during snapshot execution:
+
+```python
+def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection) -> Any:
+    row = conn.execute(
+        "SELECT node_id, file_path FROM nodes WHERE name = ? AND kind = 'structural' LIMIT 1",
+        (annotation_name,)
+    ).fetchone()
+    if row:
+        class SyntheticMock:
+            def __getattr__(self, item): return None
+        return SyntheticMock()
+    return None
+```
+
+### In-memory graph cache for high agent counts
+
+At 100+ concurrent agents, `crawl_subgraph()` BFS traversals hit SQLite on every hop. At scale, loading the `edges` table into a `dict[str, set[str]]` at SessionStart and keeping it warm via incremental updates would reduce BFS to pure dict lookups.
+
+### Deadlock cycle detection
+
+Documented in the [v2 section](#deadlock-resolution--preclaim-consensus). The `lock_queue` priority queue provides ordering but not cycle detection. The wound-wait approach (add `agent_intents` table, BFS lock-wait graph before each acquisition, wound lower-priority agent on cycle) is the concrete suggested fix.
+
+### Asymmetric invalidation cascade (edge case)
+
+`update_file()` correctly re-indexes dependent files when a node is removed or renamed. However, if Agent A *adds* a new import statement to an existing file during an allowed edit, the new dependency edge lands instantly in the DB. Agent B, if it currently holds a subgraph lock that now includes this newly connected edge as a 1-hop forward target, will fail its PostToolUse Merkle check and have its edit rejected — even though Agent B didn't touch the file Agent A just modified.
+
+This is a false positive. The correct behavior is to check whether the Merkle mismatch is caused exclusively by structural additions (new edges, new nodes) that do not invalidate the agent's write, as opposed to mutations that do.
+
+### Multi-match target collateral
+
+`identify_target_nodes()` in `dep_graph.py` maps `old_string` line positions to node line ranges using interval overlap:
+
+```python
+if line_start <= edit_line_end and line_end >= edit_line_start:
+    matched.add(node_id)
+```
+
+If an edit spans a structural boundary — e.g., an `old_string` that overlaps the tail of one function and the head of the next — the agent will acquire locks on nodes it never intended to edit. This is safe (over-locking), but increases lock collision surface area at scale.
+
+---
+
+## Edge cases in dep_graph.py
+
+When mapping an explicit AST to a relational database for deterministic runtime validation, several subtle edge-case interactions become apparent:
+
+**1. The Multi-Match Target Collateral (The "Stretching Node" Trap)**
+
+Look closely at `identify_target_nodes` for an Edit or MultiEdit call:
+
+```python
+edit_line_start = source[:offset].count("\n") + 1
+edit_line_end   = edit_line_start + old_string.count("\n")
+for node_id, line_start, line_end in rows:
+    if line_start <= edit_line_end and line_end >= edit_line_start:
+        matched.add(node_id)
+```
+
+If an agent is editing a large class or function, and they replace an `old_string` that happens to structurally match code found in both a target function and a trailing wrapper block (or if the edit overlaps structural boundaries), `identify_target_nodes` will return multiple structural node IDs. Because lock acquisition is all-or-nothing, the agent will accidentally claim locks on nodes it never intended to edit. This is safe, but increases the lock collision surface area at scale.
+
+**2. The Asymmetric Invalidation Cascade**
+
+Your graph update logic inside `update_file` handles structural deletions correctly:
+
+```python
+if prior_node_ids - new_node_ids:
+    dependent_files = [r[0] for r in conn.execute(
+        "SELECT from_file FROM edges WHERE to_file = ?", (abs_path,)
+    ).fetchall()]
+    for dep in dependent_files:
+        if dep != abs_path and Path(dep).is_file():
+            index_file(dep, project_root, conn)
+```
+
+However, if Agent A *adds* an entirely new import statement to an existing file during an allowed edit, `index_file` runs a clean purge-and-reinsert:
+
+```python
+conn.execute("DELETE FROM edges WHERE from_file = ?", (abs_path,))
+conn.executemany("INSERT OR IGNORE INTO edges (from_file, to_file) VALUES (?, ?)", edges)
+```
+
+The new dependency edge lands instantly in the database. But if Agent B is currently holding a subgraph lock that now includes this newly connected edge as a 1-hop forward target, Agent B's PostToolUse will immediately fail its Merkle check and reject Agent B's edit, even though Agent B didn't touch the file Agent A just modified.
 
 ---
 
@@ -420,232 +640,4 @@ GPLv3. Commercial products may ship the coordinator as an unmodified subprocess.
 
 ---
 
-## OPEN TODOs (16.05.2026)
-
-The Strategic Path forward: Replacing the Git Transport Layer
-Since you've proven that your SQLite dependency tracker perfectly gates execution, the Git CLI is acting as a redundant, slow database layer.
-
-[Agent A writes node] ──► PostToolUse ──► Update SQLite Cache ──► Write to Main Repo FS
-                                                                         │
-                                       ┌─────────────────────────────────┘
-                                       ▼
-[Agent B PreToolUse]  ──► Merkle Mismatch Detected ──► Python shutil.copy2() (No Git CLI)
-                                                                         │
-                                       ┌─────────────────────────────────┘
-                                       ▼
-                               Near 0ms Latency
-
-Instead of running _auto_commit_and_push via process forks, your coordinator can copy the validated structural node text changes directly into the canonical main repo directory via Python filesystem operations, updating your nodes table instantly.
-
-You then defer Git compilation entirely to SessionEnd
-
-## IDEAS FOR I/O CONTRACTS
-
-Optimizing contract.py without introducing an LLM
-To elevate your execution-based approach to a highly reliable layer, you can extend your AST parse path to implement Automated Context Injections:
-
-A. Deep Token Type Mocking
-When a type hint isn't a scalar (like int or str), parse the type string to see if it belongs to a known dataclass or structural model within your nodes database cache. Since you've already indexed the codebase into SQLite, if a function takes a user: User, your coordinator can query the nodes table for User, look up its fields, and automatically instantiate a mock object payload for the subprocess script instead of giving up with None.
-
-B. Structural Isolation
-Instead of just blacklisting calls inside the function body, use ast.NodeTransformer within your parser to strip out or stub any top-level module statements that aren't class or function definitions before writing the dynamic file to the snapshot interpreter. This ensures that simply importing the target file never triggers an accidental external initialization loop.
-
-## Edge cases in dep_graph.py:
-
-When mapping an explicit AST to a relational database for deterministic runtime validation, several subtle edge-case interactions become apparent:
-
-1. The Multi-Match Target Collateral (The "Stretching Node" Trap)
-Look closely at identify_target_nodes for an Edit or MultiEdit call:
-
-```python
-edit_line_start = source[:offset].count("\n") + 1
-edit_line_end   = edit_line_start + old_string.count("\n")
-for node_id, line_start, line_end in rows:
-    if line_start <= edit_line_end and line_end >= edit_line_start:
-        matched.add(node_id)
-```
-
-If an agent is editing a large class or function, and they replace an old_string that happens to structurally match code found in both a target function and a trailing wrapper block (or if the edit overlaps structural boundaries, like updating an un-scoped variable at line 40 that bleeds into line 41), identify_target_nodes will return multiple structural node IDs.
-
-Because lock acquisition is all-or-nothing:
-
-```python
-with conn:
-    for nid in structural_targets:
-        conn.execute("INSERT INTO locks ...")
-```
-
-If an edit spans across boundaries or triggers a multi-match, the agent will accidentally claim locks on nodes it never intended to edit. This is safe, but it increases the lock collision surface area at scale.
-
-2. The Asymmetric Invalidation Cascade
-Your graph update logic inside update_file handles structural deletions flawlessly:
-
-```python
-if prior_node_ids - new_node_ids:
-    dependent_files = [r[0] for r in conn.execute(
-        "SELECT from_file FROM edges WHERE to_file = ?", (abs_path,)
-    ).fetchall()]
-    for dep in dependent_files:
-        if dep != abs_path and Path(dep).is_file():
-            index_file(dep, project_root, conn)
-```
-If a method is removed or renamed, you re-index its dependent files to see if their imports broke or changed.
-
-However, look at what happens if Agent A adds an entirely new import statement to an existing file during an allowed edit. index_file runs a clean purge-and-reinsert:
-
-```python
-conn.execute("DELETE FROM edges WHERE from_file = ?", (abs_path,))
-# ...
-conn.executemany("INSERT OR IGNORE INTO edges (from_file, to_file) VALUES (?, ?)", edges)
-```
-
-The new dependency edge lands instantly in the database. But if Agent B is currently holding a subgraph lock that now includes this newly connected edge as a 1-hop forward target, Agent B's PostToolBatch or PostToolUse will immediately fail its Merkle check, detect an unexpected environmental drift, and reject Agent B's edit, even though Agent B didn't touch the file Agent A just modified.
-
-## Resolving var placeholder limitation
-
-Resolving the var Placeholder Limitation
-In contract.py, falling back to a dummy placeholder "var" (which maps to None at execution time) for unresolvable complex objects is a significant roadblock for real-world codebases like Django, FastAPI, or SQLAlchemy, where almost everything inherits from custom models or handles structured contexts.
-
-Since dep_graph.py gives you an incredibly accurate, queryable map of every structural node in the codebase, you can pass this information directly to contract.py to solve the object resolution deficit.
-
-Instead of abandoning typing or using simple scalar defaults, you can leverage your parsed database entries to build Synthetic Structural Mock Generics:
-
-```python
-# Conceptual extension inside contract.py using your nodes table cache
-def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection) -> Any:
-    # Check if this annotation name matches a ClassDef we have indexed
-    row = conn.execute(
-        "SELECT node_id, file_path FROM nodes WHERE name = ? AND kind = 'structural' LIMIT 1",
-        (annotation_name,)
-    ).fetchone()
-    
-    if row:
-        # We found the class definition! We can construct a lightweight 
-        # dynamic Python Mock object that mirrors its expected attributes
-        class SyntheticMock:
-            def __init__(self):
-                # Dynamically inject defaults or simple mock returns
-                pass
-            def __getattr__(self, item):
-                return None # Graceful attribute fallback to prevent AttributeError
-        return SyntheticMock()
-        
-    return None # Fallback to standard None if completely unindexed
-```
-Thank you for sharing dep_graph.py—this provides the exact technical anchor to see how the mathematical guarantees are built. Seeing the concrete implementation of both the static analysis layer and the indexing mechanism clarifies the entire graph life cycle.
-
-My previous analysis of _subgraph_stale missed a crucial architecture detail that your codebase elegant addresses: compute_merkle_root does preserve the topology perfectly!
-
-Python
-leaf = hashlib.sha256(b"".join(r[0].encode() for r in rows)).hexdigest()
-leaf_hashes.append(leaf)
-...
-return hashlib.sha256(b"".join(h.encode() for h in leaf_hashes)).hexdigest()
-By grouping individual content_hash strings by file path, sorting them by line position, creating a file-level leaf hash, and then hashing the sorted leaf collection, you have effectively built a deterministic two-tiered hierarchical Merkel Tree.
-
-Technical Deep-Dive & Edge Cases in dep_graph.py
-When mapping an explicit AST to a relational database for deterministic runtime validation, several subtle edge-case interactions become apparent:
-
-1. The Multi-Match Target Collateral (The "Stretching Node" Trap)
-Look closely at identify_target_nodes for an Edit or MultiEdit call:
-
-Python
-edit_line_start = source[:offset].count("\n") + 1
-edit_line_end   = edit_line_start + old_string.count("\n")
-for node_id, line_start, line_end in rows:
-    if line_start <= edit_line_end and line_end >= edit_line_start:
-        matched.add(node_id)
-If an agent is editing a large class or function, and they replace an old_string that happens to structurally match code found in both a target function and a trailing wrapper block (or if the edit overlaps structural boundaries, like updating an un-scoped variable at line 40 that bleeds into line 41), identify_target_nodes will return multiple structural node IDs.
-
-Because lock acquisition is all-or-nothing:
-
-Python
-with conn:
-    for nid in structural_targets:
-        conn.execute("INSERT INTO locks ...")
-If an edit spans across boundaries or triggers a multi-match, the agent will accidentally claim locks on nodes it never intended to edit. This is safe, but it increases the lock collision surface area at scale.
-
-2. The Asymmetric Invalidation Cascade
-Your graph update logic inside update_file handles structural deletions flawlessly:
-
-Python
-if prior_node_ids - new_node_ids:
-    dependent_files = [r[0] for r in conn.execute(
-        "SELECT from_file FROM edges WHERE to_file = ?", (abs_path,)
-    ).fetchall()]
-    for dep in dependent_files:
-        if dep != abs_path and Path(dep).is_file():
-            index_file(dep, project_root, conn)
-If a method is removed or renamed, you re-index its dependent files to see if their imports broke or changed.
-
-However, look at what happens if Agent A adds an entirely new import statement to an existing file during an allowed edit. index_file runs a clean purge-and-reinsert:
-
-Python
-conn.execute("DELETE FROM edges WHERE from_file = ?", (abs_path,))
-# ...
-conn.executemany("INSERT OR IGNORE INTO edges (from_file, to_file) VALUES (?, ?)", edges)
-The new dependency edge lands instantly in the database. But if Agent B is currently holding a subgraph lock that now includes this newly connected edge as a 1-hop forward target, Agent B's PostToolBatch or PostToolUse will immediately fail its Merkle check, detect an unexpected environmental drift, and reject Agent B's edit, even though Agent B didn't touch the file Agent A just modified.
-
-Resolving the var Placeholder Limitation
-In contract.py, falling back to a dummy placeholder "var" (which maps to None at execution time) for unresolvable complex objects is a significant roadblock for real-world codebases like Django, FastAPI, or SQLAlchemy, where almost everything inherits from custom models or handles structured contexts.
-
-Since dep_graph.py gives you an incredibly accurate, queryable map of every structural node in the codebase, you can pass this information directly to contract.py to solve the object resolution deficit.
-
-Instead of abandoning typing or using simple scalar defaults, you can leverage your parsed database entries to build Synthetic Structural Mock Generics:
-
-Python
-# Conceptual extension inside contract.py using your nodes table cache
-def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection) -> Any:
-    # Check if this annotation name matches a ClassDef we have indexed
-    row = conn.execute(
-        "SELECT node_id, file_path FROM nodes WHERE name = ? AND kind = 'structural' LIMIT 1",
-        (annotation_name,)
-    ).fetchone()
-    
-    if row:
-        # We found the class definition! We can construct a lightweight 
-        # dynamic Python Mock object that mirrors its expected attributes
-        class SyntheticMock:
-            def __init__(self):
-                # Dynamically inject defaults or simple mock returns
-                pass
-            def __getattr__(self, item):
-                return None # Graceful attribute fallback to prevent AttributeError
-        return SyntheticMock()
-        
-    return None # Fallback to standard None if completely unindexed
-By returning a basic object wrapped in a graceful __getattr__ safety switch instead of a raw standard NoneType, your execution runner will glide right past missing attribute assignments (request.user.id will cleanly evaluate to None instead of crashing with a fatal AttributeError), allowing you to extract structural I/O snapshots from highly complex code bases.
-
-## Eliminating cache population latency
-
-Your lazy caching methodology is clean:
-
-PreToolUse enforces a precise 1-edge-deep scan.
-
-Passive hooks (FileChanged, CwdChanged) warm the graph 2–3 edges out in the background.
-
-At a massive scale of 100 to 500 parallel agents, this architecture can completely decouple from disk reads by utilizing an In-Memory Graph State Cache.
-
-Since dep_graph.py writes directly to a centralized WAL-mode SQLite database, you can load the edges table into a fast, thread-safe in-memory graph structure (like a dict of sets) at SessionStart. Your BFS traversals inside crawl_subgraph can run at pure memory speeds without executing any SQL relational joins, reserving SQLite exclusively for holding long-lived transaction locks and content hashes.
-
-## Other possible edge cases:
-
-In dep_graph.py, when a file or node is structurally mutated or deleted, you proactively re-index its reverse dependents to ensure that the global edge list remains pristine:
-
-```python
-if prior_node_ids - new_node_ids:
-    dependent_files = [r[0] for r in conn.execute("SELECT from_file FROM edges WHERE to_file = ?", (abs_path,)).fetchall()]
-    for dep in dependent_files:
-        index_file(dep, project_root, conn)
-```
-
-The Edge Case: If Agent A removes a function signature, it triggers this recursive re-indexing across all files that import it. If Agent B is simultaneously attempting to acquire a lock in one of those dependent files, Agent B's PreToolUse loop might hit a lock contention issue on the SQLite database while index_file(dep) is writing its new nodes.
-
-To harden this for 500 agents, wrap these cascading dependent re-indexes inside a deferred background task or queue, rather than running them synchronously inside the active PostToolUse release window of the writing agent.
-
----
-
-*Design developed May 2026.*
-© Ilari Pirkkalainen [ieepirzy](https://github.com/ieepirzy) 2026
-
-**AUTHORIZED EYES ONLY DOCUMENT NOT MEANT FOR PUBLIC DISCLOSURE OR CIRCULATION UNTIL INTENTIONAL PUBLIC RELEASE**
+© [ieepirzy](https://github.com/ieepirzy) 2026

@@ -3,9 +3,8 @@
 watchdog.py — TTL enforcement for stale coordinator locks.
 
 Polls the locks table for expired rows (expires_at < now), reverts each
-affected file to its pre-lock snapshot, releases the lock, and updates the
-bloom filter. Marks any in-progress cascades belonging to expired agents
-as reverted.
+affected file to its pre-lock snapshot, releases the lock, and marks any
+in-progress cascades belonging to expired agents as reverted.
 
 Run alongside the coordinator for the duration of a session:
     python watchdog.py [--poll-interval N]   # default: 10 seconds

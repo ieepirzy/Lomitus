@@ -1030,7 +1030,7 @@ def handle_pretool(
     _record_traversal(agent_id, structural_targets, file_path, dep_files, conn)
 
     # 4. Conflict check — load the full locks table into a dict once.
-    #    Eliminates the lost-update race in the bloom load/modify/save cycle.
+    #    Single read avoids TOCTOU races from concurrent lock acquisitions.
     current_locks: dict[str, str] = dict(conn.execute(
         "SELECT node_id, agent_id FROM locks"
     ).fetchall())
