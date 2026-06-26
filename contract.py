@@ -94,8 +94,11 @@ def _literal_value(node: ast.expr) -> Any:
 def extract_literal_args(func_name: str, caller_source: str) -> tuple[list, dict] | None:
     """
     Find the first fully-literal call site for func_name in caller_source.
+    func_name may be qualified ("ClassName.method") — matching uses the unqualified
+    part so both obj.method(...) and Class.method(...) call sites are found.
     Returns (args, kwargs) or None if no resolvable call site exists.
     """
+    unqualified = func_name.split(".")[-1]
     try:
         tree = ast.parse(caller_source)
     except SyntaxError:
@@ -109,7 +112,7 @@ def extract_literal_args(func_name: str, caller_source: str) -> tuple[list, dict
             else node.func.attr if isinstance(node.func, ast.Attribute)
             else None
         )
-        if name != func_name:
+        if name != unqualified:
             continue
 
         args: list[Any] = []
@@ -171,7 +174,16 @@ _SNAPSHOT_SCRIPT = textwrap.dedent("""\
     _spec = _ilu.spec_from_file_location("_mod", {file_path!r})
     _mod  = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
-    _fn   = getattr(_mod, {func_name!r})
+    _qname = {func_name!r}
+    if "." in _qname:
+        _cls_name, _meth_name = _qname.split(".", 1)
+        _cls = getattr(_mod, _cls_name)
+        try:
+            _fn = getattr(_cls(), _meth_name)
+        except Exception:
+            _fn = getattr(_cls, _meth_name)
+    else:
+        _fn = getattr(_mod, _qname)
     _result = _fn(*[{args_repr}])
 
     def _snap(v):
@@ -304,8 +316,9 @@ def capture_node_snapshot(
         try:
             source = Path(file_path).read_text(encoding="utf-8")
             tree = ast.parse(source, filename=file_path)
+            unqualified = func_name.split(".")[-1]
             for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == unqualified:
                     args, _ = args_from_annotations(node)
                     break
         except Exception:

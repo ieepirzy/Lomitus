@@ -20,10 +20,11 @@ ROOT  = Path(__file__).parent.parent.resolve()
 COORD = str(ROOT / "coordinator.py")
 DB_PATH = ROOT / ".claude" / "coordinator.db"
 
-CALC   = str(ROOT / "tests" / "fixtures" / "calc.py")
-MODELS = str(ROOT / "tests" / "fixtures" / "models.py")
-API    = str(ROOT / "tests" / "fixtures" / "api.py")
-UTILS  = str(ROOT / "tests" / "fixtures" / "utils.py")
+CALC     = str(ROOT / "tests" / "fixtures" / "calc.py")
+MODELS   = str(ROOT / "tests" / "fixtures" / "models.py")
+API      = str(ROOT / "tests" / "fixtures" / "api.py")
+UTILS    = str(ROOT / "tests" / "fixtures" / "utils.py")
+SERVICES = str(ROOT / "tests" / "fixtures" / "services.py")
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +85,11 @@ def _post_tool_batch(agent_id: str) -> subprocess.CompletedProcess:
 
 
 def _fresh_db():
-    if DB_PATH.exists():
-        DB_PATH.unlink()
+    for p in (DB_PATH,
+              Path(str(DB_PATH) + "-wal"),
+              Path(str(DB_PATH) + "-shm")):
+        if p.exists():
+            p.unlink()
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -137,21 +141,34 @@ class TestBenignEdits(unittest.TestCase):
     def setUp(self): _fresh_db()
 
     def test_benign_blocked_by_structural_lock(self):
-        _pretool(MODELS, "a1", "class User:", "class User:  # edited")
-        r = _pretool(MODELS, "a2",
-                     "from dataclasses import dataclass",
-                     "from dataclasses import dataclass  # v2")
+        # a1 holds a structural lock on a method; a2 editing an import in the same
+        # file must be blocked (benign node + shared structural lock → block).
+        _pretool(SERVICES, "a1",
+                 "def add(self, a: int, b: int) -> int:",
+                 "def add(self, a: int, b: int) -> int:  # edited")
+        r = _pretool(SERVICES, "a2",
+                     "from .calc import add",
+                     "from .calc import add  # v2")
         self.assertEqual(r.returncode, 2)
         self.assertIn("structural lock", r.stderr)
 
     def test_different_structural_nodes_concurrent(self):
-        _pretool(MODELS, "a1", "class User:", "class User:  # edited")
-        r = _pretool(MODELS, "a2", "class Product:", "class Product:  # edited")
+        # Two structural nodes (methods of the same class) must not conflict.
+        _pretool(SERVICES, "a1",
+                 "def add(self, a: int, b: int) -> int:",
+                 "def add(self, a: int, b: int) -> int:  # edited")
+        r = _pretool(SERVICES, "a2",
+                     "def multiply(self, a: int, b: int) -> int:",
+                     "def multiply(self, a: int, b: int) -> int:  # edited")
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_same_node_second_blocked(self):
-        _pretool(MODELS, "a1", "class User:", "class User:  # v1")
-        r = _pretool(MODELS, "a2", "class User:", "class User:  # v2")
+        _pretool(SERVICES, "a1",
+                 "def add(self, a: int, b: int) -> int:",
+                 "def add(self, a: int, b: int) -> int:  # v1")
+        r = _pretool(SERVICES, "a2",
+                     "def add(self, a: int, b: int) -> int:",
+                     "def add(self, a: int, b: int) -> int:  # v2")
         self.assertEqual(r.returncode, 2)
 
 
@@ -361,19 +378,67 @@ class TestPostToolBatchProcess(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_drift_detected(self):
-        _pretool(CALC, "drift-agent", "def add(a, b): return a + b",
-                 "def add(a, b): return a + b + 0")
+        # Lock a method in services.py — services imports from calc.py, so calc.py
+        # is a dep_file and its nodes are in the subgraph_node_hashes snapshot.
+        _pretool(SERVICES, "drift-agent",
+                 "def add(self, a: int, b: int) -> int:",
+                 "def add(self, a: int, b: int) -> int:  # v2")
 
-        # Corrupt the node hash in the DB to simulate another agent's write.
+        # Corrupt a node in calc.py (a dependency of services.py) to simulate
+        # another agent changing a dep while this agent was mid-edit.
         conn = sqlite3.connect(str(DB_PATH))
-        conn.execute("UPDATE nodes SET content_hash='DIFFERENT' WHERE file_path LIKE ?",
-                     (f"%calc.py",))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "UPDATE nodes SET content_hash='DIFFERENT' WHERE file_path LIKE ?",
+                (f"%calc.py",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
         r = _post_tool_batch("drift-agent")
         self.assertEqual(r.returncode, 2, f"drift must be detected; stderr: {r.stderr}")
         self.assertIn("drift", r.stderr.lower())
+
+
+# ---------------------------------------------------------------------------
+# Method-level locking
+# ---------------------------------------------------------------------------
+
+class TestMethodLevelLocking(unittest.TestCase):
+    def setUp(self): _fresh_db()
+
+    def test_different_methods_no_conflict(self):
+        # Two agents editing different methods of the same class must not block each other.
+        r1 = _pretool(SERVICES, "a1",
+                      "def add(self, a: int, b: int) -> int:",
+                      "def add(self, a: int, b: int) -> int:  # v2")
+        r2 = _pretool(SERVICES, "a2",
+                      "def multiply(self, a: int, b: int) -> int:",
+                      "def multiply(self, a: int, b: int) -> int:  # v2")
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+
+    def test_same_method_blocked(self):
+        # Two agents targeting the same method must conflict.
+        _pretool(SERVICES, "a1",
+                 "def add(self, a: int, b: int) -> int:",
+                 "def add(self, a: int, b: int) -> int:  # v1")
+        r = _pretool(SERVICES, "a2",
+                     "def add(self, a: int, b: int) -> int:",
+                     "def add(self, a: int, b: int) -> int:  # v2")
+        self.assertEqual(r.returncode, 2)
+
+    def test_method_lock_does_not_block_sibling(self):
+        # Holding a lock on one method must not prevent another agent from
+        # acquiring a lock on a sibling method of the same class.
+        _pretool(SERVICES, "a1",
+                 "def add(self, a: int, b: int) -> int:",
+                 "def add(self, a: int, b: int) -> int:  # v1")
+        r = _pretool(SERVICES, "a2",
+                     "def multiply(self, a: int, b: int) -> int:",
+                     "def multiply(self, a: int, b: int) -> int:  # v2")
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 # ---------------------------------------------------------------------------

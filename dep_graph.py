@@ -76,15 +76,37 @@ def _classify(stmt: ast.stmt) -> Literal["structural", "external", "benign"]:
     return "benign"
 
 
-def _name(stmt: ast.stmt) -> str | None:
-    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+def _name(stmt: ast.stmt, class_name: str | None = None) -> str | None:
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return f"{class_name}.{stmt.name}" if class_name else stmt.name
+    if isinstance(stmt, ast.ClassDef):
         return stmt.name
     return None
 
 
-def _node_id(file_path: str, stmt: ast.stmt) -> str:
-    label = _name(stmt) or str(stmt.lineno)
+def _node_id(file_path: str, stmt: ast.stmt, class_name: str | None = None) -> str:
+    label = _name(stmt, class_name) or str(stmt.lineno)
     return f"{file_path}::{label}"
+
+
+def _all_stmts(tree: ast.Module) -> list[tuple[ast.stmt, str | None]]:
+    """
+    Yield (stmt, class_name) for every indexable statement in a module.
+    Module-level non-class statements are emitted with class_name=None.
+    For ClassDef, only direct method members (FunctionDef/AsyncFunctionDef) are emitted
+    — the ClassDef itself is intentionally skipped to avoid a full-body hash node that
+    would cause false-positive drift whenever any sibling method changes.
+    Non-method class body members (variables, docstrings) are benign and get no node.
+    """
+    result: list[tuple[ast.stmt, str | None]] = []
+    for stmt in tree.body:
+        if isinstance(stmt, ast.ClassDef):
+            for member in stmt.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    result.append((member, stmt.name))
+        else:
+            result.append((stmt, None))
+    return result
 
 
 def _hash(source: str, stmt: ast.stmt) -> str:
@@ -171,25 +193,28 @@ def is_fresh(file_path: str, conn: sqlite3.Connection) -> bool:
         source, tree = _parse(abs_path)
     except Exception:
         return False
-    current = {_node_id(abs_path, stmt): _hash(source, stmt) for stmt in tree.body}
+    current = {
+        _node_id(abs_path, stmt, cls): _hash(source, stmt)
+        for stmt, cls in _all_stmts(tree)
+    }
     return stored == current
 
 
 def parse_file(file_path: str) -> list[Node]:
-    """Extract all module-level nodes from a Python file."""
+    """Extract all indexable nodes from a Python file, including class methods."""
     abs_path = str(Path(file_path).resolve())
     source, tree = _parse(abs_path)
     return [
         Node(
-            node_id=_node_id(abs_path, stmt),
+            node_id=_node_id(abs_path, stmt, cls),
             file_path=abs_path,
-            name=_name(stmt),
+            name=_name(stmt, cls),
             kind=_classify(stmt),
             line_start=stmt.lineno,
             line_end=stmt.end_lineno or stmt.lineno,
             content_hash=_hash(source, stmt),
         )
-        for stmt in tree.body
+        for stmt, cls in _all_stmts(tree)
     ]
 
 
@@ -204,15 +229,15 @@ def index_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> N
 
     nodes = [
         Node(
-            node_id=_node_id(abs_path, stmt),
+            node_id=_node_id(abs_path, stmt, cls),
             file_path=abs_path,
-            name=_name(stmt),
+            name=_name(stmt, cls),
             kind=_classify(stmt),
             line_start=stmt.lineno,
             line_end=stmt.end_lineno or stmt.lineno,
             content_hash=_hash(source, stmt),
         )
-        for stmt in tree.body
+        for stmt, cls in _all_stmts(tree)
     ]
 
     import_stmts = [s for s in tree.body if isinstance(s, (ast.Import, ast.ImportFrom))]

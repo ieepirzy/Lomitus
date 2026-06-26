@@ -1003,17 +1003,21 @@ def handle_pretool(
     # A benign edit (e.g. removing an import) can invalidate a concurrent structural edit
     # being reasoned about by the lock holder.
 
-    #TODO: align with README spec ~lines 265-266
     if not structural_targets:
-        other_lock = conn.execute(
-            "SELECT agent_id FROM locks WHERE file_path = ? AND agent_id != ? LIMIT 1",
-            (file_path, agent_id),
-        ).fetchone()
-        if other_lock:
-            block(
-                f"Benign edit on '{Path(file_path).name}' blocked — "
-                f"'{other_lock[0]}' holds a structural lock on this file. Replan."
-            )
+        # Only block when the edit actually targets a named benign node (import,
+        # module-level var) AND another agent holds a structural lock on the file.
+        # Pure whitespace/comment edits (target_node_ids empty) carry no semantic
+        # risk and are always allowed — per README spec §"Benign dependency collisions".
+        if target_node_ids:
+            other_lock = conn.execute(
+                "SELECT agent_id FROM locks WHERE file_path = ? AND agent_id != ? LIMIT 1",
+                (file_path, agent_id),
+            ).fetchone()
+            if other_lock:
+                block(
+                    f"Edit on benign node in '{Path(file_path).name}' blocked — "
+                    f"'{other_lock[0]}' holds a structural lock on this file. Replan."
+                )
         allow()
 
     # 3. Crawl 1 edge forward (enforcement depth) and cold-cache any unseen deps.
@@ -1061,7 +1065,7 @@ def handle_pretool(
                 "SELECT agent_type FROM locks WHERE node_id = ?", (nid,)
             ).fetchone()
             if lock_row and lock_row[0] == "cascade":
-                cascade_detail = f" (cascade refactor in progress by '{blocker}')"
+                cascade_detail = f" (refactoring task in progress by '{blocker}')"
                 break
         # Queue this agent for each conflicting target node.
         for nid in structural_targets:
@@ -1072,24 +1076,31 @@ def handle_pretool(
         block(f"Lock conflict{cascade_detail} — {details}. {pos_str}. Replan.")
 
     # 5. Compute subgraph snapshot for drift detection at PostToolUse.
+    #    Scope: locked nodes from the target file + all nodes from dep_files.
+    #    Excluding unlocked sibling nodes from the target file prevents false-positive
+    #    drift when two agents concurrently edit different methods of the same file.
     all_files = {file_path} | dep_files
-    ph, vals = _in_clause(all_files)
-    subgraph_node_ids = [
-        r[0] for r in conn.execute(
-            f"SELECT node_id FROM nodes WHERE file_path IN ({ph})", vals
-        ).fetchall()
-    ]
     subgraph_hash = compute_merkle_root(all_files, conn)
-    # Per-node hashes for ownership-aware drift detection (v6).
-    if subgraph_node_ids:
-        ph_h, vals_h = _in_clause(subgraph_node_ids)
-        subgraph_node_hashes: dict[str, str] = {
-            r[0]: r[1] for r in conn.execute(
-                f"SELECT node_id, content_hash FROM nodes WHERE node_id IN ({ph_h})", vals_h
-            ).fetchall()
-        }
-    else:
-        subgraph_node_hashes = {}
+
+    subgraph_node_hashes: dict[str, str] = {}
+    # Locked target nodes (from the file being edited).
+    for nid in structural_targets:
+        if not _is_sentinel(nid):
+            row = conn.execute(
+                "SELECT content_hash FROM nodes WHERE node_id = ?", (nid,)
+            ).fetchone()
+            if row:
+                subgraph_node_hashes[nid] = row[0]
+    # All nodes from imported dependency files.
+    if dep_files:
+        ph_d, vals_d = _in_clause(dep_files)
+        for r in conn.execute(
+            f"SELECT node_id, content_hash FROM nodes WHERE file_path IN ({ph_d})", vals_d
+        ).fetchall():
+            subgraph_node_hashes[r[0]] = r[1]
+
+    # v1 Merkle fallback: include the same scoped node set.
+    subgraph_node_ids = list(subgraph_node_hashes.keys())
 
     # 6. Acquire locks — single transaction, all-or-nothing.
     with conn:
@@ -1146,6 +1157,38 @@ def handle_pretool(
 # PostToolUse
 # ---------------------------------------------------------------------------
 
+def _rollback_file(
+    file_path: str,
+    rows: list,
+    project_root: str,
+    conn: sqlite3.Connection,
+) -> bool:
+    """
+    Revert file_path to its pre-lock snapshot content after a drift failure.
+    Re-indexes so DB hashes reflect the reverted state.
+    Returns True if a snapshot was found and applied.
+    """
+    for row in rows:
+        node_id = row[0]
+        if _is_sentinel(node_id):
+            continue
+        snap = conn.execute(
+            "SELECT source_content FROM snapshots WHERE node_id = ?", (node_id,)
+        ).fetchone()
+        if snap and snap[0]:
+            try:
+                Path(file_path).write_text(snap[0], encoding="utf-8")
+                update_file(file_path, project_root, conn)
+                return True
+            except OSError as e:
+                print(
+                    f"[coordinator] rollback write failed for '{Path(file_path).name}': {e}",
+                    file=sys.stderr,
+                )
+                return False
+    return False
+
+
 def handle_release(
     file_path: str,
     agent_id: str,
@@ -1187,15 +1230,23 @@ def handle_release(
             stored_nodes = json.loads(subgraph_nodes_json) if subgraph_nodes_json else []
             recomputed   = compute_merkle_root_from_node_ids(stored_nodes, conn)
             if recomputed != stored_hash:
-                #TODO: implement rollback
+                reverted = _rollback_file(file_path, rows, project_root, conn)
                 conn.execute(
                     "DELETE FROM locks WHERE file_path = ? AND agent_id = ?",
                     (file_path, agent_id),
                 )
+                for r in rows:
+                    nid = r[0]
+                    if not _is_sentinel(nid):
+                        conn.execute("DELETE FROM snapshots WHERE node_id = ?", (nid,))
                 conn.commit()
+                revert_note = (
+                    " Rolled back edit." if reverted
+                    else " Rollback failed — file may be in inconsistent state."
+                )
                 print(
                     f"Subgraph drifted for '{node_id}': a dependency was mutated during the edit "
-                    "window. Edit may be built on stale state. Replan against current dependencies.",
+                    f"window.{revert_note} Replan against current dependencies.",
                     file=sys.stderr,
                 )
                 sys.exit(2)
@@ -1214,15 +1265,23 @@ def handle_release(
                 break
 
         if drifted:
-            #TODO: implement rollback
+            reverted = _rollback_file(file_path, rows, project_root, conn)
             conn.execute(
                 "DELETE FROM locks WHERE file_path = ? AND agent_id = ?",
                 (file_path, agent_id),
             )
+            for r in rows:
+                nid = r[0]
+                if not _is_sentinel(nid):
+                    conn.execute("DELETE FROM snapshots WHERE node_id = ?", (nid,))
             conn.commit()
+            revert_note = (
+                " Rolled back edit." if reverted
+                else " Rollback failed — file may be in inconsistent state."
+            )
             print(
                 f"Subgraph drifted for '{drifted}': a dependency was mutated during the edit "
-                "window. Edit may be built on stale state. Replan against current dependencies.",
+                f"window.{revert_note} Replan against current dependencies.",
                 file=sys.stderr,
             )
             sys.exit(2)
