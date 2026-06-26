@@ -6,8 +6,6 @@
 
 > [!NOTE]
 >  This repository uses Claude as a comparison and a baseline agentic harness, however the only Claude-specific thing is the schema of the hooks. The concept of hooks exists for all agentic harnesses making this framework harness agnostic with minor revisions.
-
-> [!NOTE]
 > **Language scope:** The coordinator currently supports Python only. `_is_python()` guard in `handle_pretool()` passes non-Python files through uncoordinated. TypeScript/JavaScript dep graph integration (madge, dependency-cruiser) is a planned extension.
 
 ## Origin
