@@ -13,7 +13,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py --session-start"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py --session-start"
           }
         ]
       }
@@ -23,7 +23,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py --session-end"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py --session-end"
           }
         ]
       }
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py --subagent-start"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py --subagent-start"
           }
         ]
       }
@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py --subagent-stop"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py --subagent-stop"
           }
         ]
       }
@@ -53,7 +53,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py --worktree-create-hook"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py --worktree-create-hook"
           }
         ]
       }
@@ -63,7 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py --worktree-remove"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py --worktree-remove"
           }
         ]
       }
@@ -73,7 +73,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py --file-changed"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py --file-changed"
           }
         ]
       }
@@ -83,7 +83,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py --cwd-changed"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py --cwd-changed"
           }
         ]
       }
@@ -94,7 +94,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py --pre-compact"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py --pre-compact"
           }
         ]
       }
@@ -105,7 +105,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py"
           }
         ]
       }
@@ -116,7 +116,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py --release"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py --release"
           }
         ]
       }
@@ -127,7 +127,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /home/ilari/Software/Repositories/Lomitus/coordinator.py --failure"
+            "command": "python /home/ilari/Software/Repositories/Lomitus/lomitus/coordinator.py --failure"
           }
         ]
       }
