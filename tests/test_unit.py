@@ -15,17 +15,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-# Repo root on path so coordinator/dep_graph/etc. import cleanly.
-ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT))
-
-from contract import (
+from lomitus.contract import (
     args_from_annotations,
     extract_literal_args,
     has_external_calls,
     is_superset,
 )
-from coordinator import (
+from lomitus.coordinator import (
     _cascade_mark_complete,
     _cascade_trigger,
     _enqueue_agent,
@@ -40,7 +36,7 @@ from coordinator import (
     handle_subagent_stop,
     _migrate,
 )
-from dep_graph import SCHEMA as DEP_SCHEMA, index_file, is_fresh, update_file
+from lomitus.dep_graph import SCHEMA as DEP_SCHEMA, index_file, is_fresh, update_file
 
 
 # ---------------------------------------------------------------------------

@@ -16,8 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT  = Path(__file__).parent.parent.resolve()
-COORD = str(ROOT / "coordinator.py")
+ROOT    = Path(__file__).parent.parent.resolve()
 DB_PATH = ROOT / ".claude" / "coordinator.db"
 
 CALC     = str(ROOT / "tests" / "fixtures" / "calc.py")
@@ -33,11 +32,12 @@ SERVICES = str(ROOT / "tests" / "fixtures" / "services.py")
 
 def _run(payload: dict, *flags: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, COORD, *flags],
+        [sys.executable, "-m", "lomitus", "hook", *flags],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
         cwd=str(ROOT),
+        env={**__import__("os").environ, "PYTHONPATH": str(ROOT / "src")},
     )
 
 
