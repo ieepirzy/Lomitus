@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 
 from lomitus.contract import (
+    _UNRESOLVABLE,
     args_from_annotations,
     extract_literal_args,
     has_external_calls,
@@ -314,10 +315,10 @@ class TestContractSystem(unittest.TestCase):
         args, _ = args_from_annotations(tree.body[0])
         self.assertEqual(args, [0, 0])
 
-    def test_args_from_annotations_var_placeholder(self):
+    def test_args_from_annotations_unresolvable_placeholder(self):
         tree = ast.parse("def process(data, count: int): pass\n")
         args, _ = args_from_annotations(tree.body[0])
-        self.assertEqual(args, ["var", 0])
+        self.assertEqual(args, [_UNRESOLVABLE, 0])
 
     def test_is_superset_additive_passes(self):
         req = {"type": "dict", "keys": {"x": {"type": "int"}}}
