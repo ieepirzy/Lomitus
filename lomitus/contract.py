@@ -17,12 +17,23 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
-#TODO: What the fuck is this, this is just a list of existing ones for nodes that do network calls/have external deps
-#TODO: This shit has way too many false positives and negatives, this is way too weak to pass for production
-#TODO: this does not answer the question which external dependency nodes should "does the call graph of this specific function reach a node with observable side effects at execution time.""
-
 # Modules whose presence in a function body marks the node as "external".
 # External nodes are locked but skipped for I/O snapshot execution.
+#
+# Matching against this set alone only catches *direct* calls with the
+# literal module name in scope. dep_graph._classify_module builds on top of
+# has_external_calls()/import_aliases() below to also catch:
+#   - aliased/from-imports ("import httpx as http", "from urllib import request")
+#     via import_aliases()
+#   - transitive same-file calls (a "pure"-looking function that calls a
+#     local helper which itself does a network/db call) via the call-graph
+#     propagation in dep_graph._classify_module
+#   - the same propagation across a resolved "from project_module import name"
+#     edge, via dep_graph.index_file's cross-file DB lookup
+# It does not attempt to resolve dynamic dispatch, qualified module calls
+# through a project-internal alias (e.g. "import mymod; mymod.fn()"), or
+# decorators/wrappers — those remain conservatively "structural" unless a
+# direct or transitively-reachable call matches this list.
 EXTERNAL_CALL_PREFIXES: frozenset[str] = frozenset({
     "requests", "httpx", "aiohttp", "urllib", "urllib3",
     "socket", "smtplib", "ftplib",
@@ -44,7 +55,7 @@ _UNRESOLVABLE = object()  # sentinel for args we cannot resolve statically
 
 
 # ---------------------------------------------------------------------------
-# External call detection (used by dep_graph._classify)
+# External call detection (used by dep_graph._classify_module)
 # ---------------------------------------------------------------------------
 
 def _call_root(node: ast.expr) -> str | None:
@@ -55,14 +66,50 @@ def _call_root(node: ast.expr) -> str | None:
     return None
 
 
-def has_external_calls(stmt: ast.stmt) -> bool:
-    """Return True if a function/class body calls any known external module."""
+def import_aliases(tree: ast.Module) -> dict[str, str]:
+    """
+    Map names bound by this module's top-level imports to their root module
+    name, so aliased/from-imports resolve the same as a direct import:
+      "import httpx as http"        -> {"http": "httpx"}
+      "from urllib import request"  -> {"request": "urllib"}
+      "import urllib.request as r"  -> {"r": "urllib"}
+    Only module-level imports are considered — a function-local "import x"
+    only binds within that function and is out of scope for this heuristic.
+    """
+    aliases: dict[str, str] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                root = alias.name.split(".")[0]
+                bound = (alias.asname or alias.name).split(".")[0]
+                aliases[bound] = root
+        elif isinstance(stmt, ast.ImportFrom):
+            if stmt.level:  # relative import — not an external module
+                continue
+            root = (stmt.module or "").split(".")[0]
+            for alias in stmt.names:
+                if alias.name == "*":
+                    continue
+                bound = alias.asname or alias.name
+                aliases[bound] = root
+    return aliases
+
+
+def has_external_calls(stmt: ast.stmt, aliases: dict[str, str] | None = None) -> bool:
+    """
+    Return True if a function/class body directly calls a known external
+    module. 'aliases' (see import_aliases) resolves aliased/from-imported
+    names to their root module before matching against EXTERNAL_CALL_PREFIXES.
+    This only detects *direct* calls — see dep_graph._classify_module for
+    transitive (same-file and cross-file) propagation.
+    """
     if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return False
+    aliases = aliases or {}
     for node in ast.walk(stmt):
         if isinstance(node, ast.Call):
             root = _call_root(node.func)
-            if root and root in EXTERNAL_CALL_PREFIXES:
+            if root and aliases.get(root, root) in EXTERNAL_CALL_PREFIXES:
                 return True
     return False
 
