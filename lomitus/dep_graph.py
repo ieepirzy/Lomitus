@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from lomitus.contract import EXTERNAL_CALL_PREFIXES
+from lomitus.contract import has_external_calls, import_aliases
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
@@ -40,8 +40,6 @@ CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file);
 CREATE INDEX IF NOT EXISTS idx_edges_to   ON edges(to_file);
 """
 
-# TODO: implement effect typing for nodes, i.e pure,io,netowkr,db.. these should be propagated transitively
-# if a pure function calls an io function, then it's io.
 @dataclass(frozen=True)
 class Node:
     node_id: str
@@ -53,27 +51,110 @@ class Node:
     content_hash: str
 
 
-def _call_root(node: ast.expr) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return _call_root(node.value)
-    return None
-
-# TODO: refacor this to be durable, this should answer something closer to "does the call graph of this specific function reach a node with observable side effects at execution time."
-def _has_external_calls(stmt: ast.stmt) -> bool:
+def _call_targets(stmt: ast.stmt) -> tuple[set[str], set[str]]:
+    """
+    Names called from within a function/method body that might reference
+    another function defined in the same file.
+    Returns (bare_names, self_or_cls_attrs):
+      bare_names        — "helper()" — may be a top-level function, or an
+                           imported project symbol (see _project_import_targets).
+      self_or_cls_attrs — "self.helper()" / "cls.helper()" — a method on
+                           the same class.
+    """
+    bare: set[str] = set()
+    attrs: set[str] = set()
     for node in ast.walk(stmt):
         if isinstance(node, ast.Call):
-            root = _call_root(node.func)
-            if root and root in EXTERNAL_CALL_PREFIXES: #TODO: absolutely fucking not, this is not scalable in the slightest
-                return True
-    return False
+            func = node.func
+            if isinstance(func, ast.Name):
+                bare.add(func.id)
+            elif (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id in ("self", "cls")
+            ):
+                attrs.add(func.attr)
+    return bare, attrs
 
 
-def _classify(stmt: ast.stmt) -> Literal["structural", "external", "benign"]:
-    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return "external" if _has_external_calls(stmt) else "structural"
-    return "benign"
+def _classify_module(
+    tree: ast.Module,
+    aliases: dict[str, str] | None = None,
+    extra_external: frozenset[str] = frozenset(),
+) -> dict[str, Literal["structural", "external"]]:
+    """
+    Classify every function/method in a module as "structural" or "external",
+    answering (to the extent AST-level static analysis can) "does the call
+    graph of this function reach a node with an observable side effect at
+    execution time":
+
+      1. Direct effect: the function's own body calls a known external
+         module (has_external_calls, alias-aware).
+      2. Same-file transitive effect: the function calls another
+         function/method defined in this file (bare name, or self./cls.
+         attribute) that is (transitively) external.
+      3. Cross-file transitive effect: 'extra_external' seeds names that are
+         already known to be external via a resolved same-file-shaped call
+         edge (see dep_graph.index_file, which resolves "from project_module
+         import name" edges against already-indexed nodes).
+
+    Propagation is a fixed-point BFS over the reversed call graph, so cycles
+    (mutual recursion) terminate safely. Qualified calls through a project-
+    internal module alias ("import mymod; mymod.fn()") and dynamic dispatch
+    are not resolved — those stay conservatively "structural" unless some
+    other reachable call is directly external.
+    """
+    if aliases is None:
+        aliases = import_aliases(tree)
+
+    kind: dict[str, Literal["structural", "external"]] = {}
+    call_bare: dict[str, set[str]] = {}
+    call_attr: dict[str, set[str]] = {}
+    class_of: dict[str, str | None] = {}
+    top_level: set[str] = set()
+
+    for stmt, cls in _all_stmts(tree):
+        if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        qualname = _name(stmt, cls)
+        if qualname is None:
+            continue
+        kind[qualname] = "external" if has_external_calls(stmt, aliases) else "structural"
+        call_bare[qualname], call_attr[qualname] = _call_targets(stmt)
+        class_of[qualname] = cls
+        if cls is None:
+            top_level.add(qualname)
+
+    for name in extra_external:
+        if name not in kind:
+            kind[name] = "external"
+            top_level.add(name)
+
+    reverse: dict[str, set[str]] = {q: set() for q in kind}
+    for qualname, bare in call_bare.items():
+        for name in bare:
+            if name in top_level:
+                reverse[name].add(qualname)
+        cls = class_of.get(qualname)
+        if cls is not None:
+            for name in call_attr[qualname]:
+                target = f"{cls}.{name}"
+                if target in kind:
+                    reverse[target].add(qualname)
+
+    frontier = {q for q, k in kind.items() if k == "external"}
+    seen = set(frontier)
+    while frontier:
+        nxt: set[str] = set()
+        for node_name in frontier:
+            for caller in reverse.get(node_name, ()):
+                if caller not in seen:
+                    seen.add(caller)
+                    kind[caller] = "external"
+                    nxt.add(caller)
+        frontier = nxt
+
+    return kind
 
 
 def _name(stmt: ast.stmt, class_name: str | None = None) -> str | None:
@@ -172,6 +253,43 @@ def resolve_import(
     return [r for r in results if r != str(origin)]
 
 
+def _project_import_targets(
+    tree: ast.Module,
+    from_file: str,
+    project_root: str,
+) -> dict[str, tuple[str, str]]:
+    """
+    Map bare names bound by "from project_module import name [as alias]" to
+    (resolved_absolute_file, name) when project_module resolves to a file
+    within the project. Used by index_file to look up whether an imported
+    symbol is already classified "external" in another file's indexed nodes,
+    so effect typing propagates across file boundaries, not just within one.
+    Plain "import x" bindings are qualified at call sites (x.func()) and are
+    not resolved here — see _classify_module's docstring for that limitation.
+    """
+    targets: dict[str, tuple[str, str]] = {}
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.ImportFrom):
+            continue
+        resolved = resolve_import(stmt, from_file, project_root)
+        if not resolved:
+            continue
+        target_file = resolved[0]
+        for alias in stmt.names:
+            if alias.name == "*":
+                continue
+            bound = alias.asname or alias.name
+            targets[bound] = (target_file, alias.name)
+    return targets
+
+
+def _lookup_kind(conn: sqlite3.Connection, file_path: str, name: str) -> str | None:
+    row = conn.execute(
+        "SELECT kind FROM nodes WHERE file_path = ? AND name = ?", (file_path, name)
+    ).fetchone()
+    return row[0] if row else None
+
+
 def _parse(file_path: str) -> tuple[str, ast.Module]:
     source = Path(file_path).read_text(encoding="utf-8")
     return source, ast.parse(source, filename=file_path)
@@ -200,16 +318,32 @@ def is_fresh(file_path: str, conn: sqlite3.Connection) -> bool:
     return stored == current
 
 
+def _kind_of(
+    kind_map: dict[str, Literal["structural", "external"]],
+    stmt: ast.stmt,
+    class_name: str | None,
+) -> Literal["structural", "external", "benign"]:
+    name = _name(stmt, class_name)
+    if name is None:
+        return "benign"
+    return kind_map.get(name, "benign")
+
+
 def parse_file(file_path: str) -> list[Node]:
-    """Extract all indexable nodes from a Python file, including class methods."""
+    """
+    Extract all indexable nodes from a Python file, including class methods.
+    Effect typing here is same-file only (no conn/project_root to look up
+    cross-file classifications) — see index_file for the cross-file pass.
+    """
     abs_path = str(Path(file_path).resolve())
     source, tree = _parse(abs_path)
+    kind_map = _classify_module(tree)
     return [
         Node(
             node_id=_node_id(abs_path, stmt, cls),
             file_path=abs_path,
             name=_name(stmt, cls),
-            kind=_classify(stmt),
+            kind=_kind_of(kind_map, stmt, cls),
             line_start=stmt.lineno,
             line_end=stmt.end_lineno or stmt.lineno,
             content_hash=_hash(source, stmt),
@@ -223,16 +357,31 @@ def index_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> N
     Parse a file and upsert its nodes and outbound edges into the DB.
     Existing rows for this file are replaced atomically — handles additions,
     modifications, and removals in one pass.
+
+    Effect typing (see _classify_module) propagates transitively within this
+    file, plus one cross-file hop: for each "from project_module import name"
+    binding, if project_module is already indexed and that name's node is
+    "external", this file's callers of that name are seeded external too.
+    Kept in sync on later changes via update_file's dependent re-indexing.
     """
     abs_path = str(Path(file_path).resolve())
     source, tree = _parse(abs_path)
+
+    aliases = import_aliases(tree)
+    import_targets = _project_import_targets(tree, abs_path, project_root)
+    extra_external = frozenset(
+        name
+        for name, (target_file, target_name) in import_targets.items()
+        if _lookup_kind(conn, target_file, target_name) == "external"
+    )
+    kind_map = _classify_module(tree, aliases=aliases, extra_external=extra_external)
 
     nodes = [
         Node(
             node_id=_node_id(abs_path, stmt, cls),
             file_path=abs_path,
             name=_name(stmt, cls),
-            kind=_classify(stmt),
+            kind=_kind_of(kind_map, stmt, cls),
             line_start=stmt.lineno,
             line_end=stmt.end_lineno or stmt.lineno,
             content_hash=_hash(source, stmt),
@@ -322,14 +471,21 @@ def update_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> 
     Graph extensions (new imports added) and deletions are both handled by
     index_file's delete-then-reinsert approach.
 
-    Structural deletions: if nodes disappear (or the file is removed entirely),
-    all files with inbound edges to this file are re-indexed so their edge lists
-    reflect current state and orphaned edges are purged.
+    Dependent re-indexing: all files with inbound edges to this file are
+    re-indexed when either (a) this file's node set changed (structural
+    deletions/additions — edge lists need to reflect current state and
+    orphaned edges are purged) or (b) any node's effect-typing "kind"
+    changed (e.g. a function gained/lost a network call) — dependents may
+    import from this file and their own cross-file classification
+    (index_file's extra_external lookup) needs to pick up the new value.
+    This re-indexes only direct dependents (one hop); a change that flips a
+    node's kind cascades further only as each affected file is itself
+    subsequently updated.
     """
     abs_path = str(Path(file_path).resolve())
 
-    prior_node_ids = {r[0] for r in conn.execute(
-        "SELECT node_id FROM nodes WHERE file_path = ?", (abs_path,)
+    prior_rows = {r[0]: r[1] for r in conn.execute(
+        "SELECT node_id, kind FROM nodes WHERE file_path = ?", (abs_path,)
     ).fetchall()}
 
     if not Path(abs_path).is_file():
@@ -350,11 +506,13 @@ def update_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> 
 
     index_file(file_path, project_root, conn)
 
-    if prior_node_ids:
-        new_node_ids = {r[0] for r in conn.execute(
-            "SELECT node_id FROM nodes WHERE file_path = ?", (abs_path,)
+    if prior_rows:
+        new_rows = {r[0]: r[1] for r in conn.execute(
+            "SELECT node_id, kind FROM nodes WHERE file_path = ?", (abs_path,)
         ).fetchall()}
-        if prior_node_ids - new_node_ids:
+        node_ids_changed = set(prior_rows) != set(new_rows)
+        kind_changed = any(new_rows.get(nid) != k for nid, k in prior_rows.items())
+        if node_ids_changed or kind_changed:
             dependent_files = [r[0] for r in conn.execute(
                 "SELECT from_file FROM edges WHERE to_file = ?", (abs_path,)
             ).fetchall()]
