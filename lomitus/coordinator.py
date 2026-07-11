@@ -1252,10 +1252,14 @@ def handle_release(
                 sys.exit(2)
             continue
 
-        # Per-node comparison: skip nodes this agent wrote itself.
+        # Per-node comparison: skip *dependency* nodes this agent wrote itself in the
+        # same batch, but always check the node this lock directly protects — a lock's
+        # own target must never be excluded by its holder's own traversal record.
         drifted: str | None = None
         for nid, stored_h in stored_node_hashes.items():
-            if nid in agent_traversal or _is_sentinel(nid):
+            if _is_sentinel(nid):
+                continue
+            if nid != node_id and nid in agent_traversal:
                 continue
             curr = conn.execute(
                 "SELECT content_hash FROM nodes WHERE node_id = ?", (nid,)
@@ -2118,9 +2122,13 @@ def handle_post_tool_batch(payload: dict, conn: sqlite3.Connection) -> None:
                 drift_nodes.append(node_id.rsplit("::", 1)[-1])
             continue
 
-        # Per-node comparison: skip nodes this agent wrote itself.
+        # Per-node comparison: skip *dependency* nodes this agent wrote itself in the
+        # same batch, but always check the node this lock directly protects — a lock's
+        # own target must never be excluded by its holder's own traversal record.
         for nid, stored_h in stored_node_hashes.items():
-            if nid in agent_traversal or _is_sentinel(nid):
+            if _is_sentinel(nid):
+                continue
+            if nid != node_id and nid in agent_traversal:
                 continue
             curr = conn.execute(
                 "SELECT content_hash FROM nodes WHERE node_id = ?", (nid,)
