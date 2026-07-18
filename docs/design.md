@@ -397,9 +397,9 @@ The LLMs do the actual code work. The coordinator does assignment and collision 
 
 ## Complexity Estimate
 
-- v0: ~100 LOC Python. An afternoon.
-- v1: MSc or large project tier for a pragmatic Python implementation. The dep graph integration and subgraph hashing are the bulk of the work. **Implemented** (~2200 LOC Python total).
-- v2: Approaches PhD territory only if targeting formal correctness guarantees across arbitrary languages. For pragmatic Python with open-world validation and heuristic TTL, it stays at MSc or comparable level. **Implemented** (cascade flow, TTL revert, watchdog, worktree management all functional).
+Approaches PhD territory only if targeting formal correctness guarantees across arbitrary languages. For pragmatic Python with open-world validation and heuristic TTL, it stays at MSc or comparable level. **Implemented** (cascade flow, TTL revert, watchdog, worktree management all functional for python).
+
+- Project scope to python-only for now. Patterns likely generalize across languages, as codegraph generation libraries exist.
 
 The integration of runtime agent coordination, partial AST rollback, live dep graph, and I/O contract validation from real call sites is novel relative to the current ecosystem. No existing multi-agent coding framework implements this combination.
 
