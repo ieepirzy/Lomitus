@@ -21,7 +21,9 @@ from lomitus.contract import (
     extract_literal_args,
     has_external_calls,
     import_aliases,
+    isolated_snapshot_source,
     is_superset,
+    take_snapshot_result,
 )
 from lomitus.coordinator import (
     _cascade_mark_complete,
@@ -320,6 +322,41 @@ class TestContractSystem(unittest.TestCase):
         args, _ = args_from_annotations(tree.body[0])
         self.assertEqual(args, [_UNRESOLVABLE, 0])
 
+    def test_snapshot_does_not_run_module_initialization(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            marker = d / "initialized"
+            module = d / "subject.py"
+            module.write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n"
+                "VALUE = 4\ndef compute(value: int): return value + VALUE\n"
+            )
+
+            result = take_snapshot_result(str(module), "compute", [2], str(d))
+
+            self.assertEqual(result.status, "ok", result.detail)
+            self.assertEqual(result.snapshot, {"type": "int"})
+            self.assertFalse(marker.exists(), "module-level initialization must be stripped")
+
+    def test_snapshot_failure_has_explicit_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            module = Path(d) / "subject.py"
+            module.write_text("def compute(): raise RuntimeError('broken')\n")
+
+            result = take_snapshot_result(str(module), "compute", [], d)
+
+            self.assertEqual(result.status, "execution_error")
+            self.assertIn("RuntimeError", result.detail or "")
+
+    def test_snapshot_rewriter_keeps_definitions_and_safe_constants(self):
+        with tempfile.TemporaryDirectory() as d:
+            module = Path(d) / "subject.py"
+            module.write_text("SAFE = 3\nUNSAFE = factory()\ndef compute(): return SAFE\n")
+            rewritten = isolated_snapshot_source(str(module))
+            self.assertIn("SAFE = 3", rewritten)
+            self.assertIn("def compute", rewritten)
+            self.assertNotIn("factory()", rewritten)
+
     def test_is_superset_additive_passes(self):
         req = {"type": "dict", "keys": {"x": {"type": "int"}}}
         act = {"type": "dict", "keys": {"x": {"type": "int"}, "y": {"type": "str"}}}
@@ -606,6 +643,33 @@ class TestPostToolBatch(unittest.TestCase):
 
             code = _exit(handle_post_tool_batch, {"agent_id": "agent-d"}, conn)
             self.assertEqual(code, 2, "drift must cause PostToolBatch to block")
+
+    def test_deleted_snapshotted_node_is_drift(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "deleted.py"
+            f.write_text("def compute(): return 1\n")
+            conn = _coord_db()
+            _pretool(conn, f, "agent-d", "def compute(): return 1", "def compute(): return 2")
+            with conn:
+                conn.execute("DELETE FROM nodes WHERE file_path=?", (str(f.resolve()),))
+
+            code = _exit(handle_post_tool_batch, {"agent_id": "agent-d"}, conn)
+            self.assertEqual(code, 2, "deleting a snapshotted node must cause drift")
+
+    def test_new_node_does_not_expand_existing_snapshot(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "addition.py"
+            f.write_text("def compute(): return 1\n")
+            conn = _coord_db()
+            _pretool(conn, f, "agent-a", "def compute(): return 1", "def compute(): return 2")
+            with conn:
+                conn.execute(
+                    "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (f"{f.resolve()}::added", str(f.resolve()), "added", "structural", 2, 2, "NEW"),
+                )
+
+            code = _exit(handle_post_tool_batch, {"agent_id": "agent-a"}, conn)
+            self.assertEqual(code, 0, "structural additions must not expand an existing snapshot")
 
     def test_no_locks_no_op(self):
         conn = _coord_db()

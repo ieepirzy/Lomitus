@@ -21,6 +21,16 @@ Three versioned capability layers, all implemented:
 
 See [docs/design.md](docs/design.md) for the full architecture and design rationale.
 
+Lomitus is alpha software. Its coordination guarantees apply only to Python files and
+the hook-managed edit window. I/O contract snapshots are best-effort: unsupported
+arguments or execution failures are recorded and skip contract comparison for that
+node. The snapshot rewriter removes initialization from the target module, but imports
+and the selected function still execute; it is process isolation, not a security sandbox.
+
+Current scalability and correctness limitations—including deadlock cycles, conservative
+multi-node targeting, and effect-classification blind spots—are listed in the
+[design document](docs/design.md#current-limitations-and-roadmap).
+
 ## Install
 
 ```bash

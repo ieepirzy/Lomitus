@@ -62,7 +62,12 @@ from lomitus.dep_graph import (
     update_file,
     parse_file,
 )
-from lomitus.contract import _UNRESOLVABLE, capture_node_snapshot, is_superset, take_snapshot
+from lomitus.contract import (
+    _UNRESOLVABLE,
+    capture_node_snapshot_result,
+    is_superset,
+    take_snapshot_result,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -134,6 +139,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
     source_content TEXT NOT NULL,
     io_snapshot    TEXT,
     io_args        TEXT,
+    io_status      TEXT,
+    io_error       TEXT,
     snapshotted_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -257,6 +264,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     lock_cols = {r[1] for r in conn.execute("PRAGMA table_info(locks)").fetchall()}
     if "subgraph_node_hashes" not in lock_cols:
         conn.execute("ALTER TABLE locks ADD COLUMN subgraph_node_hashes TEXT")
+    snapshot_cols = {r[1] for r in conn.execute("PRAGMA table_info(snapshots)").fetchall()}
+    if "io_status" not in snapshot_cols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN io_status TEXT")
+    if "io_error" not in snapshot_cols:
+        conn.execute("ALTER TABLE snapshots ADD COLUMN io_error TEXT")
     conn.commit()
 
 
@@ -792,15 +804,18 @@ def _store_snapshot(
         source_content = Path(file_path).read_text(encoding="utf-8")
     except OSError:
         return
-    args, io_snap = capture_node_snapshot(file_path, func_name, project_root, caller_sources)
+    args, result = capture_node_snapshot_result(
+        file_path, func_name, project_root, caller_sources
+    )
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO snapshots "
-            "(node_id, file_path, source_content, io_snapshot, io_args) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "(node_id, file_path, source_content, io_snapshot, io_args, io_status, io_error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (node_id, file_path, source_content,
-             json.dumps(io_snap) if io_snap is not None else None,
-             json.dumps([None if a is _UNRESOLVABLE else a for a in args]) if args is not None else None),
+             json.dumps(result.snapshot) if result.snapshot is not None else None,
+             json.dumps([None if a is _UNRESOLVABLE else a for a in args]) if args is not None else None,
+             result.status, result.detail),
         )
 
 
@@ -949,7 +964,7 @@ def handle_pretool(
     #    Before any lock is acquired, verify that the agent's view of the target
     #    file and its 1-hop dependency subgraph matches the canonical DB state.
     #    If not: auto-rebase the worktree onto main and block so the agent replans
-    #    with the updated code. This makes merge conflicts structurally impossible:
+    #    with the updated code. This reduces stale-view merge conflicts:
     #    the lock window covers read → edit → commit → push-to-main atomically.
     wt_path = _get_worktree_for_file(file_path, conn)
     if wt_path:
@@ -1264,7 +1279,7 @@ def handle_release(
             curr = conn.execute(
                 "SELECT content_hash FROM nodes WHERE node_id = ?", (nid,)
             ).fetchone()
-            if curr and curr[0] != stored_h:
+            if curr is None or curr[0] != stored_h:
                 drifted = nid
                 break
 
@@ -1316,9 +1331,19 @@ def handle_release(
         name_row = conn.execute("SELECT name FROM nodes WHERE node_id = ?", (node_id,)).fetchone()
         if not name_row or not name_row[0]:
             continue
-        new_snap = take_snapshot(file_path, name_row[0], args, project_root)
-        if new_snap is None:
+        new_result = take_snapshot_result(file_path, name_row[0], args, project_root)
+        if new_result.snapshot is None:
+            conn.execute(
+                "UPDATE snapshots SET io_status = ?, io_error = ? WHERE node_id = ?",
+                (f"post_{new_result.status}", new_result.detail, node_id),
+            )
+            print(
+                f"[coordinator] contract validation skipped for '{name_row[0]}': "
+                f"{new_result.status}",
+                file=sys.stderr,
+            )
             continue
+        new_snap = new_result.snapshot
         if not is_superset(old_snap, new_snap):
             cascade_nodes = _cascade_trigger(file_path, node_id, agent_id, agent_type, conn)
             if cascade_nodes:
@@ -2133,7 +2158,7 @@ def handle_post_tool_batch(payload: dict, conn: sqlite3.Connection) -> None:
             curr = conn.execute(
                 "SELECT content_hash FROM nodes WHERE node_id = ?", (nid,)
             ).fetchone()
-            if curr and curr[0] != stored_h:
+            if curr is None or curr[0] != stored_h:
                 drift_nodes.append(node_id.rsplit("::", 1)[-1])
                 break
 

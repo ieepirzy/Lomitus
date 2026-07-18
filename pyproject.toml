@@ -39,3 +39,4 @@ Issues = "https://github.com/ieepirzy/Lomitus/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

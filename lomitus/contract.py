@@ -14,6 +14,7 @@ import json
 import subprocess
 import sys
 import textwrap
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,15 @@ ANNOTATION_DEFAULTS: dict[str, Any] = {
 }
 
 _UNRESOLVABLE = object()  # sentinel for args we cannot resolve statically
+
+
+@dataclass(frozen=True)
+class SnapshotResult:
+    """Result of snapshot execution, including why validation was unavailable."""
+
+    status: str
+    snapshot: dict | None = None
+    detail: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -214,13 +224,13 @@ def args_from_annotations(
 # ---------------------------------------------------------------------------
 
 _SNAPSHOT_SCRIPT = textwrap.dedent("""\
-    import sys, json
+    import sys, json, types
     sys.path.insert(0, {project_root!r})
     sys.path.insert(0, {file_dir!r})
-    import importlib.util as _ilu
-    _spec = _ilu.spec_from_file_location("_mod", {file_path!r})
-    _mod  = _ilu.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
+    _mod = types.ModuleType("_mod")
+    _mod.__file__ = {file_path!r}
+    sys.modules["_mod"] = _mod
+    exec(compile({source!r}, {file_path!r}, "exec"), _mod.__dict__)
     _qname = {func_name!r}
     if "." in _qname:
         _cls_name, _meth_name = _qname.split(".", 1)
@@ -255,6 +265,88 @@ _SNAPSHOT_SCRIPT = textwrap.dedent("""\
 """)
 
 
+_SAFE_DECORATORS = {"dataclass", "staticmethod", "classmethod", "property"}
+
+
+def _decorator_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Call):
+        return _decorator_name(node.func)
+    return None
+
+
+def _safe_assignment(stmt: ast.stmt) -> bool:
+    value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+    if value is None:
+        return False
+    try:
+        ast.literal_eval(value)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+class _SnapshotSanitizer(ast.NodeTransformer):
+    """Remove executable initialization while retaining callable definitions."""
+
+    def _function(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
+        node.decorator_list = [
+            d for d in node.decorator_list if _decorator_name(d) in _SAFE_DECORATORS
+        ]
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):  # noqa: N802
+        return self._function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):  # noqa: N802
+        return self._function(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef):  # noqa: N802
+        node.decorator_list = [
+            d for d in node.decorator_list if _decorator_name(d) in _SAFE_DECORATORS
+        ]
+        body: list[ast.stmt] = []
+        for stmt in node.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                visited = self.visit(stmt)
+                if visited is not None:
+                    body.append(visited)
+            elif isinstance(stmt, (ast.Assign, ast.AnnAssign)) and _safe_assignment(stmt):
+                body.append(stmt)
+            elif isinstance(stmt, ast.Pass):
+                body.append(stmt)
+        node.body = body or [ast.Pass()]
+        return node
+
+
+def isolated_snapshot_source(file_path: str) -> str:
+    """Return source with import-time initialization removed.
+
+    Imports are retained because definitions may need them. This prevents the target
+    module's top-level initialization from running, but it is not a security sandbox:
+    imported modules and the target function itself still execute normally.
+    """
+    source = Path(file_path).read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=file_path)
+    sanitizer = _SnapshotSanitizer()
+    kept: list[ast.stmt] = []
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            kept.append(stmt)
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            visited = sanitizer.visit(stmt)
+            if visited is not None:
+                kept.append(visited)
+        elif isinstance(stmt, (ast.Assign, ast.AnnAssign)) and _safe_assignment(stmt):
+            kept.append(stmt)
+    tree.body = kept or [ast.Pass()]
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
+
+
 def _args_repr(args: list) -> str:
     """Render args as Python literal expressions for embedding in the snapshot script."""
     return ", ".join("None" if a is _UNRESOLVABLE else repr(a) for a in args)
@@ -272,10 +364,27 @@ def take_snapshot(
     Returns None on any failure — import error, timeout, external dep missing, etc.
     Callers treat None as "snapshot unavailable, skip contract validation for this node."
     """
+    return take_snapshot_result(file_path, func_name, args, project_root, timeout).snapshot
+
+
+def take_snapshot_result(
+    file_path: str,
+    func_name: str,
+    args: list,
+    project_root: str,
+    timeout: int = 5,
+) -> SnapshotResult:
+    """Execute an isolated snapshot and preserve its success/failure reason."""
+    try:
+        source = isolated_snapshot_source(file_path)
+    except (OSError, SyntaxError) as exc:
+        return SnapshotResult("rewrite_error", detail=str(exc))
+
     script = _SNAPSHOT_SCRIPT.format(
         project_root=project_root,
         file_dir=str(Path(file_path).parent),
         file_path=str(file_path),
+        source=source,
         func_name=func_name,
         args_repr=_args_repr(args),
     )
@@ -286,11 +395,19 @@ def take_snapshot(
             text=True,
             timeout=timeout,
         )
-        if result.returncode != 0 or not result.stdout.strip():
-            return None
-        return json.loads(result.stdout.strip())
-    except Exception:
-        return None
+        if result.returncode != 0:
+            detail = result.stderr.strip() or f"snapshot process exited {result.returncode}"
+            return SnapshotResult("execution_error", detail=detail[-2000:])
+        if not result.stdout.strip():
+            return SnapshotResult("empty_output", detail="snapshot process produced no output")
+        try:
+            return SnapshotResult("ok", snapshot=json.loads(result.stdout.strip()))
+        except json.JSONDecodeError as exc:
+            return SnapshotResult("invalid_output", detail=str(exc))
+    except subprocess.TimeoutExpired:
+        return SnapshotResult("timeout", detail=f"snapshot exceeded {timeout}s")
+    except Exception as exc:
+        return SnapshotResult("execution_error", detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -349,8 +466,21 @@ def capture_node_snapshot(
     execute in subprocess, return (args, io_snapshot).
     Returns (None, None) if capture is not possible.
     """
+    args, result = capture_node_snapshot_result(
+        file_path, func_name, project_root, caller_sources
+    )
+    return args, result.snapshot
+
+
+def capture_node_snapshot_result(
+    file_path: str,
+    func_name: str | None,
+    project_root: str,
+    caller_sources: list[str],
+) -> tuple[list | None, SnapshotResult]:
+    """Capture a node snapshot while retaining an explicit outcome status."""
     if not func_name:
-        return None, None
+        return None, SnapshotResult("not_callable", detail="node has no callable name")
 
     args: list | None = None
     for src in caller_sources:
@@ -372,7 +502,6 @@ def capture_node_snapshot(
             pass
 
     if args is None:
-        return None, None
+        return None, SnapshotResult("unresolved_args", detail="no arguments could be synthesized")
 
-    snapshot = take_snapshot(file_path, func_name, args, project_root)
-    return args, snapshot
+    return args, take_snapshot_result(file_path, func_name, args, project_root)
