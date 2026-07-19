@@ -9,6 +9,7 @@ TTL crash recovery, FileChanged unlink, PostToolBatch drift detection.
 from __future__ import annotations
 
 import ast
+import json
 import sqlite3
 import sys
 import tempfile
@@ -16,13 +17,16 @@ import unittest
 from pathlib import Path
 
 from lomitus.contract import (
+    _MockArg,
     _UNRESOLVABLE,
     args_from_annotations,
+    capture_node_snapshot_result,
     extract_literal_args,
     has_external_calls,
     import_aliases,
     isolated_snapshot_source,
     is_superset,
+    mock_type_from_db,
     take_snapshot_result,
 )
 from lomitus.coordinator import (
@@ -451,6 +455,151 @@ class TestContractSystem(unittest.TestCase):
             self.assertEqual(row[0], "reverted")
             for nid in cascade_nodes:
                 self.assertIsNone(conn.execute("SELECT 1 FROM locks WHERE node_id=?", (nid,)).fetchone())
+
+
+# ---------------------------------------------------------------------------
+# Synthetic mocks for complex-type args (issue #8)
+# ---------------------------------------------------------------------------
+
+class TestSyntheticMocks(unittest.TestCase):
+    """
+    Covers docs/design.md "Synthetic mocks for complex types": a parameter
+    annotated with a project-defined class (dataclass or plain class) must
+    resolve to a working synthetic mock instead of silently degrading to
+    _UNRESOLVABLE/None, which today makes I/O contract validation a no-op
+    for any function whose interesting parameters are project-defined types.
+    """
+
+    def _index(self, d: Path, name: str, source: str) -> tuple[Path, sqlite3.Connection]:
+        f = d / name
+        f.write_text(source)
+        conn = _dep_db()
+        index_file(str(f), str(d), conn)
+        return f, conn
+
+    def _func_node(self, f: Path, func_name: str) -> ast.FunctionDef:
+        tree = ast.parse(f.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == func_name:
+                return node
+        raise AssertionError(f"{func_name} not found in {f}")
+
+    def test_dataclass_param_gets_synthetic_mock(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            f, conn = self._index(
+                d, "point.py",
+                "from dataclasses import dataclass\n"
+                "@dataclass\n"
+                "class Point:\n"
+                "    x: int\n"
+                "    y: int\n"
+                "    def magnitude(self):\n"
+                "        return (self.x ** 2 + self.y ** 2) ** 0.5\n"
+                "def locate(p: Point) -> int:\n"
+                "    return 1\n",
+            )
+            func_node = self._func_node(f, "locate")
+
+            # Without a conn, resolution still falls back to _UNRESOLVABLE (today's behavior).
+            args_no_conn, _ = args_from_annotations(func_node)
+            self.assertIs(args_no_conn[0], _UNRESOLVABLE)
+
+            # With conn, the dataclass is indexed (via its method) and resolves to a mock.
+            args, _ = args_from_annotations(func_node, conn)
+            self.assertIsInstance(args[0], _MockArg)
+            self.assertEqual(args[0].annotation_name, "Point")
+
+    def test_project_class_param_gets_synthetic_mock(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            f, conn = self._index(
+                d, "config.py",
+                "class Config:\n"
+                "    def get(self, key):\n"
+                "        return None\n"
+                "def configure(cfg: Config) -> int:\n"
+                "    return 1\n",
+            )
+            func_node = self._func_node(f, "configure")
+
+            args, _ = args_from_annotations(func_node, conn)
+            self.assertIsInstance(args[0], _MockArg)
+            self.assertEqual(args[0].annotation_name, "Config")
+
+    def test_mock_type_from_db_returns_none_for_unindexed_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            _, conn = self._index(d, "solo.py", "def foo(): pass\n")
+            self.assertIsNone(mock_type_from_db("NoSuchClass", conn))
+            self.assertIsNone(mock_type_from_db("NoSuchClass", None))
+
+    def test_synthetic_mock_snapshot_executes_successfully(self):
+        """
+        End-to-end: a function that reads an attribute off a complex-typed argument
+        must snapshot successfully once conn is threaded through, whereas today's
+        None-substitution behavior would raise AttributeError inside the subprocess
+        and get recorded as 'execution_error' — silently skipping contract validation.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            f, conn = self._index(
+                d, "opts.py",
+                "class Options:\n"
+                "    def get(self, key):\n"
+                "        return None\n"
+                "def process(opts: Options) -> int:\n"
+                "    return 1 if opts.verbose else 0\n",
+            )
+            func_node = self._func_node(f, "process")
+
+            # Today's behavior: unresolved arg becomes a bare None at execution time,
+            # opts.verbose on None raises AttributeError -> execution_error.
+            legacy_args, _ = args_from_annotations(func_node)
+            legacy_result = take_snapshot_result(str(f), "process", legacy_args, str(d))
+            self.assertEqual(legacy_result.status, "execution_error")
+
+            # Fixed behavior: conn resolves Options to a synthetic mock; opts.verbose
+            # falls back to None via __getattr__ instead of raising.
+            mock_args, _ = args_from_annotations(func_node, conn)
+            result = take_snapshot_result(str(f), "process", mock_args, str(d))
+            self.assertEqual(result.status, "ok", result.detail)
+            self.assertEqual(result.snapshot, {"type": "int"})
+
+    def test_capture_node_snapshot_result_wires_conn_through(self):
+        """Full pipeline (as used by coordinator._store_snapshot) picks up the mock too."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            f, conn = self._index(
+                d, "opts2.py",
+                "class Options:\n"
+                "    def get(self, key):\n"
+                "        return None\n"
+                "def process(opts: Options) -> int:\n"
+                "    return 1 if opts.verbose else 0\n",
+            )
+            args, result = capture_node_snapshot_result(
+                str(f), "process", str(d), caller_sources=[], conn=conn
+            )
+            self.assertIsNotNone(args)
+            self.assertIsInstance(args[0], _MockArg)
+            self.assertEqual(result.status, "ok", result.detail)
+            self.assertEqual(result.snapshot, {"type": "int"})
+
+    def test_mock_arg_json_round_trip_in_args_repr(self):
+        """
+        Simulates the snapshots.io_args storage round trip (coordinator._store_snapshot
+        writes _MockArg.to_json(), handle_release reads it back via plain json.loads —
+        losing the _MockArg class identity but keeping the marker shape). _args_repr
+        must still recognize it and emit a _SyntheticMock(...) construction, not a
+        literal dict/None.
+        """
+        from lomitus.contract import _args_repr
+
+        mock = _MockArg("Options")
+        round_tripped = json.loads(json.dumps(mock.to_json()))
+        self.assertEqual(_args_repr([mock]), "_SyntheticMock('Options')")
+        self.assertEqual(_args_repr([round_tripped]), "_SyntheticMock('Options')")
 
 
 # ---------------------------------------------------------------------------
