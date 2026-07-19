@@ -423,24 +423,28 @@ Before execution, `contract.py` rewrites the target module to retain imports, ca
 
 This is not a security sandbox. Retained imports may execute imported-module initialization, and the selected function executes project code. Arbitrary decorators are removed; only a small safe allowlist is retained. Modules that depend on executable initialization may produce an unavailable snapshot, in which case contract validation is explicitly skipped for that node.
 
-### Synthetic mocks for complex types
+### Synthetic mocks for complex types (implemented, with a known gap)
 
-When argument resolution falls back to type annotations, only scalar types (`int`, `str`, `bool`, etc.) produce working default values. Parameters annotated with complex types (dataclasses, Pydantic models, SQLAlchemy ORM objects) fall back to `None`, which often makes the snapshot unavailable. The coordinator records the failure status and skips contract validation for that node; complex-type synthesis remains future work.
+When argument resolution falls back to type annotations, only scalar types (`int`, `str`, `bool`, etc.) produce working default values. Parameters annotated with complex types (dataclasses, Pydantic models, SQLAlchemy ORM objects, or any other project-defined class) used to fall back to `None`, which routinely made the snapshot unavailable — I/O contract validation silently no-opped for exactly the call sites where a semantic contract change was most likely to matter.
 
-**Suggested fix:** when an annotation name is not a known scalar, query the `nodes` table for a `ClassDef` with that name. If found, read its `__init__` fields and construct a lightweight mock object with those fields set to their own defaults. `__getattr__` fallback to `None` prevents `AttributeError` during snapshot execution:
+`contract.mock_type_from_db(annotation_name, conn)` now backs `args_from_annotations` (an optional `conn` parameter): when an annotation name isn't a known scalar, it queries the `nodes` table and, if a match is found, returns a `_MockArg` marker instead of giving up. That marker is expanded inside the snapshot subprocess into a `_SyntheticMock` instance whose `__getattr__` falls back to `None`, so code that reads fields off the argument runs instead of raising `AttributeError`.
+
+The original sketch above queried for a `ClassDef` row directly, but `dep_graph`'s `nodes` table does not store `ClassDef` statements — only class *methods*, indexed as `"ClassName.method"` (see `dep_graph._all_stmts`, which intentionally skips the class body itself to avoid a whole-class hash node). The actual lookup matches on that shape instead:
 
 ```python
-def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection) -> Any:
+def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection | None) -> "_MockArg | None":
+    if conn is None:
+        return None
     row = conn.execute(
-        "SELECT node_id, file_path FROM nodes WHERE name = ? AND kind = 'structural' LIMIT 1",
-        (annotation_name,)
+        "SELECT node_id FROM nodes WHERE name LIKE ? LIMIT 1",
+        (f"{annotation_name}.%",),
     ).fetchone()
-    if row:
-        class SyntheticMock:
-            def __getattr__(self, item): return None
-        return SyntheticMock()
-    return None
+    if row is None:
+        return None
+    return _MockArg(annotation_name)
 ```
+
+**Known gap:** a project-defined class with no explicit methods at all (e.g. a bare-field dataclass with only field annotations) produces no indexed node under this scheme and is therefore still unresolvable — narrower than the original "any `ClassDef`" framing. Fixing this fully would mean indexing classes themselves as nodes, which has its own tradeoffs (see the false-positive-drift rationale in `dep_graph._all_stmts`) and is left as further work.
 
 ### In-memory graph cache for high agent counts
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import json
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -197,13 +198,85 @@ def extract_literal_args(func_name: str, caller_source: str) -> tuple[list, dict
     return None
 
 
+# Marker key used when a _MockArg round-trips through the `snapshots.io_args` JSON
+# column (see coordinator._store_snapshot / handle_release) — a live _MockArg only
+# exists in-process between args_from_annotations and _args_repr; anything read back
+# from SQLite arrives as a plain dict and is re-recognised via this shape.
+_MOCK_ARG_KEY = "__lomitus_synthetic_mock__"
+
+
+class _MockArg:
+    """
+    Placeholder for an argument whose annotation resolved to a project-defined class
+    (see mock_type_from_db) rather than a known scalar. Not the mock object itself:
+    the actual instance only makes sense inside the snapshot subprocess (it needs the
+    `_SyntheticMock` class defined in _SNAPSHOT_SCRIPT), so this marker just carries
+    the class name across for _args_repr to embed a fresh construction call into the
+    generated script.
+    """
+
+    __slots__ = ("annotation_name",)
+
+    def __init__(self, annotation_name: str) -> None:
+        self.annotation_name = annotation_name
+
+    def __repr__(self) -> str:
+        return f"_MockArg({self.annotation_name!r})"
+
+    def to_json(self) -> dict:
+        """JSON-safe form for storage in the snapshots.io_args column."""
+        return {_MOCK_ARG_KEY: self.annotation_name}
+
+    @staticmethod
+    def from_json(value: Any) -> "_MockArg | None":
+        """Recover a _MockArg from its JSON-decoded form, or None if value isn't one."""
+        if isinstance(value, dict) and set(value) == {_MOCK_ARG_KEY}:
+            return _MockArg(value[_MOCK_ARG_KEY])
+        return None
+
+
+def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection | None) -> "_MockArg | None":
+    """
+    Look up whether annotation_name is a project-defined class indexed in the
+    dependency graph (dataclass, ORM model, or any other project class), and if so
+    return a marker telling the snapshot subprocess to construct a lightweight mock
+    in its place instead of falling back to None.
+
+    dep_graph._all_stmts only indexes a class's *methods* — the ClassDef statement
+    itself is intentionally not stored as a node (see its docstring: storing the
+    whole class body would cause false-positive drift whenever any sibling method
+    changes). A class's presence is therefore inferred from any indexed method whose
+    qualified `name` is "ClassName.method", which is exactly the shape dep_graph._name
+    produces for class members. A class with no methods at all (e.g. a bare-field
+    dataclass with no explicit methods) has no indexed node and cannot be detected
+    this way — narrower than the design doc's "query for a ClassDef" sketch, but
+    that matches what dep_graph actually persists.
+    """
+    if conn is None:
+        return None
+    row = conn.execute(
+        "SELECT node_id FROM nodes WHERE name LIKE ? LIMIT 1",
+        (f"{annotation_name}.%",),
+    ).fetchone()
+    if row is None:
+        return None
+    return _MockArg(annotation_name)
+
+
 def args_from_annotations(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[list, dict]:
     """
     Construct call arguments from type annotations.
-    Falls back to _UNRESOLVABLE for unannotated params — _args_repr maps these to None
-    so the function can still be called without a string-sentinel collision.
+    Known scalar annotations (ANNOTATION_DEFAULTS) get a real default value. An
+    annotation naming an indexed project-defined class gets a synthetic mock via
+    mock_type_from_db (see docs/design.md "Synthetic mocks for complex types")
+    instead of being left unresolvable — conn is optional and, when omitted, this
+    step is simply skipped (matches call sites that don't have a DB handle handy).
+    Falls back to _UNRESOLVABLE for unannotated params or annotations that resolve
+    to neither — _args_repr maps these to None so the function can still be called
+    without a string-sentinel collision.
     """
     args: list[Any] = []
     for arg in func_node.args.args:
@@ -214,6 +287,8 @@ def args_from_annotations(
             args.append(_UNRESOLVABLE)
         elif isinstance(ann, ast.Name) and ann.id in ANNOTATION_DEFAULTS:
             args.append(ANNOTATION_DEFAULTS[ann.id])
+        elif isinstance(ann, ast.Name) and (mock := mock_type_from_db(ann.id, conn)) is not None:
+            args.append(mock)
         else:
             args.append(_UNRESOLVABLE)
     return args, {}
@@ -227,6 +302,17 @@ _SNAPSHOT_SCRIPT = textwrap.dedent("""\
     import sys, json, types
     sys.path.insert(0, {project_root!r})
     sys.path.insert(0, {file_dir!r})
+
+    class _SyntheticMock:
+        \"\"\"Stand-in for a project-defined class (see contract.mock_type_from_db)
+        whose real constructor and fields are unknown here. Any attribute access
+        falls back to None instead of raising AttributeError, so code under
+        snapshot that reads fields off a complex-typed argument still runs.\"\"\"
+        def __init__(self, type_name=None):
+            self._synthetic_type_name = type_name
+        def __getattr__(self, item):
+            return None
+
     _mod = types.ModuleType("_mod")
     _mod.__file__ = {file_path!r}
     sys.modules["_mod"] = _mod
@@ -254,6 +340,11 @@ _SNAPSHOT_SCRIPT = textwrap.dedent("""\
             return {{"type": type(v).__name__, "element": elem, "len": len(v)}}
         if isinstance(v, dict):
             return {{"type": "dict", "keys": {{k: _snap(vv) for k, vv in v.items()}}}}
+        if isinstance(v, _SyntheticMock):
+            # Must be checked before the hasattr() probes below — _SyntheticMock's
+            # __getattr__ fallback makes hasattr() true for literally any name, so
+            # it would otherwise be misidentified as a dataclass or ndarray.
+            return {{"type": "mock", "cls": v._synthetic_type_name}}
         if hasattr(v, "__dataclass_fields__"):
             return {{"type": "dataclass", "cls": type(v).__name__,
                     "fields": {{f: _snap(getattr(v, f)) for f in v.__dataclass_fields__}}}}
@@ -348,8 +439,23 @@ def isolated_snapshot_source(file_path: str) -> str:
 
 
 def _args_repr(args: list) -> str:
-    """Render args as Python literal expressions for embedding in the snapshot script."""
-    return ", ".join("None" if a is _UNRESOLVABLE else repr(a) for a in args)
+    """
+    Render args as Python literal expressions for embedding in the snapshot script.
+    A _MockArg (fresh from args_from_annotations, or reloaded from the snapshots.io_args
+    JSON column via _MockArg.from_json) renders as a `_SyntheticMock(...)` construction
+    call referencing the class defined in _SNAPSHOT_SCRIPT, rather than a plain repr().
+    """
+    parts: list[str] = []
+    for a in args:
+        if a is _UNRESOLVABLE:
+            parts.append("None")
+            continue
+        mock = a if isinstance(a, _MockArg) else _MockArg.from_json(a)
+        if mock is not None:
+            parts.append(f"_SyntheticMock({mock.annotation_name!r})")
+        else:
+            parts.append(repr(a))
+    return ", ".join(parts)
 
 
 def take_snapshot(
@@ -447,6 +553,9 @@ def is_superset(required: dict, actual: dict) -> bool:
                 return False
             if not is_superset(req_val, actual["fields"][field]):
                 return False
+    elif t == "mock":
+        if required.get("cls") != actual.get("cls"):
+            return False
     # Scalars and NoneType: type match above is sufficient.
     return True
 
@@ -460,14 +569,17 @@ def capture_node_snapshot(
     func_name: str | None,
     project_root: str,
     caller_sources: list[str],
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[list | None, dict | None]:
     """
     Full pipeline: find args (literal call sites → annotations → give up),
     execute in subprocess, return (args, io_snapshot).
     Returns (None, None) if capture is not possible.
+    conn, if given, lets annotation-based resolution synthesize mocks for
+    complex-typed parameters via mock_type_from_db instead of giving up.
     """
     args, result = capture_node_snapshot_result(
-        file_path, func_name, project_root, caller_sources
+        file_path, func_name, project_root, caller_sources, conn
     )
     return args, result.snapshot
 
@@ -477,8 +589,13 @@ def capture_node_snapshot_result(
     func_name: str | None,
     project_root: str,
     caller_sources: list[str],
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[list | None, SnapshotResult]:
-    """Capture a node snapshot while retaining an explicit outcome status."""
+    """
+    Capture a node snapshot while retaining an explicit outcome status.
+    conn, if given, lets annotation-based resolution synthesize mocks for
+    complex-typed parameters via mock_type_from_db instead of giving up.
+    """
     if not func_name:
         return None, SnapshotResult("not_callable", detail="node has no callable name")
 
@@ -496,7 +613,7 @@ def capture_node_snapshot_result(
             unqualified = func_name.split(".")[-1]
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == unqualified:
-                    args, _ = args_from_annotations(node)
+                    args, _ = args_from_annotations(node, conn)
                     break
         except Exception:
             pass

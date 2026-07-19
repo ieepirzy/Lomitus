@@ -63,6 +63,7 @@ from lomitus.dep_graph import (
     parse_file,
 )
 from lomitus.contract import (
+    _MockArg,
     _UNRESOLVABLE,
     capture_node_snapshot_result,
     is_superset,
@@ -805,7 +806,7 @@ def _store_snapshot(
     except OSError:
         return
     args, result = capture_node_snapshot_result(
-        file_path, func_name, project_root, caller_sources
+        file_path, func_name, project_root, caller_sources, conn
     )
     with conn:
         conn.execute(
@@ -814,7 +815,10 @@ def _store_snapshot(
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (node_id, file_path, source_content,
              json.dumps(result.snapshot) if result.snapshot is not None else None,
-             json.dumps([None if a is _UNRESOLVABLE else a for a in args]) if args is not None else None,
+             json.dumps([
+                 None if a is _UNRESOLVABLE else (a.to_json() if isinstance(a, _MockArg) else a)
+                 for a in args
+             ]) if args is not None else None,
              result.status, result.detail),
         )
 
