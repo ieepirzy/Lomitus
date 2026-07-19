@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import json
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -53,6 +54,19 @@ ANNOTATION_DEFAULTS: dict[str, Any] = {
 }
 
 _UNRESOLVABLE = object()  # sentinel for args we cannot resolve statically
+
+
+class SyntheticMock:
+    """
+    Stand-in object for a complex-type parameter (dataclass, Pydantic model,
+    SQLAlchemy ORM object, or any other project-defined class) whose real
+    shape we cannot construct statically. Attribute access falls back to
+    None instead of raising, so a function that merely reads through the
+    mock during snapshot execution does not blow up on a missing field.
+    """
+
+    def __getattr__(self, item: str) -> Any:
+        return None
 
 
 @dataclass(frozen=True)
@@ -197,13 +211,47 @@ def extract_literal_args(func_name: str, caller_source: str) -> tuple[list, dict
     return None
 
 
+def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection) -> Any:
+    """
+    Resolve a complex-type annotation (a name not in ANNOTATION_DEFAULTS) against
+    the nodes table. If annotation_name matches an indexed project-defined class —
+    a dataclass, Pydantic model, SQLAlchemy ORM object, or any other class with at
+    least one method — return a SyntheticMock in its place so snapshot execution
+    has something to call/read instead of None. Falls back to _UNRESOLVABLE when
+    no matching class is indexed, same as the pre-existing behavior for
+    unresolvable params.
+
+    dep_graph._all_stmts intentionally skips ClassDef itself when indexing —
+    only its method members become nodes, stored as "ClassName.method_name"
+    (see that function's docstring: a whole-class node would cause false-positive
+    drift on every sibling method edit). So a class is never present in this table
+    under its own bare name; it is only detectable via a node whose name starts
+    with "annotation_name.". GLOB (not LIKE) is used to match that prefix: GLOB's
+    wildcards are "*" and "?", neither of which is a legal character in a Python
+    identifier, so annotation_name needs no escaping. LIKE's wildcard "_" *is* a
+    legal identifier character and would silently mismatch on class names
+    containing an underscore.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM nodes WHERE name GLOB ? LIMIT 1",
+        (f"{annotation_name}.*",),
+    ).fetchone()
+    if row is None:
+        return _UNRESOLVABLE
+    return SyntheticMock()
+
+
 def args_from_annotations(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[list, dict]:
     """
     Construct call arguments from type annotations.
-    Falls back to _UNRESOLVABLE for unannotated params — _args_repr maps these to None
-    so the function can still be called without a string-sentinel collision.
+    Scalar annotations (see ANNOTATION_DEFAULTS) get a safe default value. Complex-type
+    annotations fall back to mock_type_from_db when conn is provided, synthesizing a
+    SyntheticMock from an indexed ClassDef instead of giving up outright.
+    Falls back to _UNRESOLVABLE for unannotated or unresolvable params — _args_repr maps
+    these to None so the function can still be called without a string-sentinel collision.
     """
     args: list[Any] = []
     for arg in func_node.args.args:
@@ -214,6 +262,8 @@ def args_from_annotations(
             args.append(_UNRESOLVABLE)
         elif isinstance(ann, ast.Name) and ann.id in ANNOTATION_DEFAULTS:
             args.append(ANNOTATION_DEFAULTS[ann.id])
+        elif isinstance(ann, ast.Name) and conn is not None:
+            args.append(mock_type_from_db(ann.id, conn))
         else:
             args.append(_UNRESOLVABLE)
     return args, {}
@@ -227,6 +277,10 @@ _SNAPSHOT_SCRIPT = textwrap.dedent("""\
     import sys, json, types
     sys.path.insert(0, {project_root!r})
     sys.path.insert(0, {file_dir!r})
+
+    class _SyntheticMock:
+        def __getattr__(self, item): return None
+
     _mod = types.ModuleType("_mod")
     _mod.__file__ = {file_path!r}
     sys.modules["_mod"] = _mod
@@ -348,8 +402,21 @@ def isolated_snapshot_source(file_path: str) -> str:
 
 
 def _args_repr(args: list) -> str:
-    """Render args as Python literal expressions for embedding in the snapshot script."""
-    return ", ".join("None" if a is _UNRESOLVABLE else repr(a) for a in args)
+    """
+    Render args as Python literal expressions for embedding in the snapshot script.
+    SyntheticMock instances have no useful repr() of their own — the snapshot script
+    defines an equivalent _SyntheticMock class (see _SNAPSHOT_SCRIPT), so a mock arg
+    is rendered as a constructor call into that class instead.
+    """
+    parts = []
+    for a in args:
+        if a is _UNRESOLVABLE:
+            parts.append("None")
+        elif isinstance(a, SyntheticMock):
+            parts.append("_SyntheticMock()")
+        else:
+            parts.append(repr(a))
+    return ", ".join(parts)
 
 
 def take_snapshot(
@@ -460,14 +527,17 @@ def capture_node_snapshot(
     func_name: str | None,
     project_root: str,
     caller_sources: list[str],
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[list | None, dict | None]:
     """
     Full pipeline: find args (literal call sites → annotations → give up),
     execute in subprocess, return (args, io_snapshot).
     Returns (None, None) if capture is not possible.
+    conn, when provided, lets annotation-based args resolve complex-type
+    params via mock_type_from_db instead of falling back to _UNRESOLVABLE.
     """
     args, result = capture_node_snapshot_result(
-        file_path, func_name, project_root, caller_sources
+        file_path, func_name, project_root, caller_sources, conn
     )
     return args, result.snapshot
 
@@ -477,6 +547,7 @@ def capture_node_snapshot_result(
     func_name: str | None,
     project_root: str,
     caller_sources: list[str],
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[list | None, SnapshotResult]:
     """Capture a node snapshot while retaining an explicit outcome status."""
     if not func_name:
@@ -496,7 +567,7 @@ def capture_node_snapshot_result(
             unqualified = func_name.split(".")[-1]
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == unqualified:
-                    args, _ = args_from_annotations(node)
+                    args, _ = args_from_annotations(node, conn)
                     break
         except Exception:
             pass

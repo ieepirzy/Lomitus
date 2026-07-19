@@ -423,24 +423,26 @@ Before execution, `contract.py` rewrites the target module to retain imports, ca
 
 This is not a security sandbox. Retained imports may execute imported-module initialization, and the selected function executes project code. Arbitrary decorators are removed; only a small safe allowlist is retained. Modules that depend on executable initialization may produce an unavailable snapshot, in which case contract validation is explicitly skipped for that node.
 
-### Synthetic mocks for complex types
+### Synthetic mocks for complex types (implemented)
 
-When argument resolution falls back to type annotations, only scalar types (`int`, `str`, `bool`, etc.) produce working default values. Parameters annotated with complex types (dataclasses, Pydantic models, SQLAlchemy ORM objects) fall back to `None`, which often makes the snapshot unavailable. The coordinator records the failure status and skips contract validation for that node; complex-type synthesis remains future work.
+When argument resolution falls back to type annotations, only scalar types (`int`, `str`, `bool`, etc.) produce working default values. Parameters annotated with complex types (dataclasses, Pydantic models, SQLAlchemy ORM objects) previously fell back to `None`, which often made the snapshot unavailable.
 
-**Suggested fix:** when an annotation name is not a known scalar, query the `nodes` table for a `ClassDef` with that name. If found, read its `__init__` fields and construct a lightweight mock object with those fields set to their own defaults. `__getattr__` fallback to `None` prevents `AttributeError` during snapshot execution:
+`contract.mock_type_from_db()` now queries the `nodes` table when an annotation name is not a known scalar. Note that `dep_graph._all_stmts` intentionally never stores a `ClassDef` under its own bare name — only its method members are indexed, as `"ClassName.method_name"` (a whole-class node would cause false-positive drift on every sibling method edit; see [Edge cases in dep_graph.py](#edge-cases-in-dep_graphpy)). So detection matches on a node whose name starts with `"{annotation_name}."`:
 
 ```python
 def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection) -> Any:
     row = conn.execute(
-        "SELECT node_id, file_path FROM nodes WHERE name = ? AND kind = 'structural' LIMIT 1",
-        (annotation_name,)
+        "SELECT 1 FROM nodes WHERE name GLOB ? LIMIT 1",
+        (f"{annotation_name}.*",),
     ).fetchone()
-    if row:
-        class SyntheticMock:
-            def __getattr__(self, item): return None
-        return SyntheticMock()
-    return None
+    if row is None:
+        return _UNRESOLVABLE
+    return SyntheticMock()
 ```
+
+`SyntheticMock.__getattr__` falls back to `None` for any unread field, preventing `AttributeError` during snapshot execution. `_args_repr()` and `_SNAPSHOT_SCRIPT` render a `SyntheticMock` arg as a call into an equivalent `_SyntheticMock` class defined inside the subprocess script, rather than a `repr()` of the mock itself.
+
+**Known limitation:** a class with no method members at all (e.g. a bare `@dataclass` with only field declarations and no explicit methods) produces zero nodes under this indexing scheme, so it still cannot be detected and falls back to `_UNRESOLVABLE`. Only classes with at least one indexed method are synthesizable today. Storing ClassDef nodes directly would fix this but reintroduces the false-positive drift problem `_all_stmts` was written to avoid, so it is left as further future work rather than folded in here.
 
 ### In-memory graph cache for high agent counts
 

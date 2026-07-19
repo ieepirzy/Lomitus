@@ -17,12 +17,14 @@ from pathlib import Path
 
 from lomitus.contract import (
     _UNRESOLVABLE,
+    SyntheticMock,
     args_from_annotations,
     extract_literal_args,
     has_external_calls,
     import_aliases,
     isolated_snapshot_source,
     is_superset,
+    mock_type_from_db,
     take_snapshot_result,
 )
 from lomitus.coordinator import (
@@ -321,6 +323,94 @@ class TestContractSystem(unittest.TestCase):
         tree = ast.parse("def process(data, count: int): pass\n")
         args, _ = args_from_annotations(tree.body[0])
         self.assertEqual(args, [_UNRESOLVABLE, 0])
+
+    def test_args_from_annotations_dataclass_synthesizes_mock(self):
+        """
+        A dataclass-typed param resolves to a SyntheticMock, not _UNRESOLVABLE.
+        Indexes a real source file through the real dep_graph pipeline (index_file)
+        rather than hand-inserting a row, so this exercises the actual node shape
+        dep_graph produces: a dataclass's own ClassDef is never stored (see
+        dep_graph._all_stmts), only its method members, as "Payload.method_name".
+        """
+        with tempfile.TemporaryDirectory() as d:
+            model = Path(d) / "model.py"
+            model.write_text(
+                "from dataclasses import dataclass\n"
+                "\n"
+                "@dataclass\n"
+                "class Payload:\n"
+                "    x: int\n"
+                "    y: str\n"
+                "\n"
+                "    def total(self):\n"
+                "        return self.x\n"
+            )
+            conn = _dep_db()
+            index_file(str(model), d, conn)
+            tree = ast.parse("def handle(payload: Payload): pass\n")
+            args, _ = args_from_annotations(tree.body[0], conn)
+        self.assertEqual(len(args), 1)
+        self.assertIsInstance(args[0], SyntheticMock)
+
+    def test_args_from_annotations_project_class_synthesizes_mock(self):
+        """A plain project-defined class param also resolves to a SyntheticMock."""
+        with tempfile.TemporaryDirectory() as d:
+            widgets = Path(d) / "widgets.py"
+            widgets.write_text(
+                "class Widget:\n"
+                "    def __init__(self, name):\n"
+                "        self.name = name\n"
+                "    def greet(self):\n"
+                "        return self.name\n"
+            )
+            conn = _dep_db()
+            index_file(str(widgets), d, conn)
+            tree = ast.parse("def build(widget: Widget): pass\n")
+            args, _ = args_from_annotations(tree.body[0], conn)
+        self.assertIsInstance(args[0], SyntheticMock)
+
+    def test_args_from_annotations_no_matching_classdef_stays_unresolvable(self):
+        """No indexed class for the annotation — behavior is unchanged from before."""
+        conn = _dep_db()
+        tree = ast.parse("def handle(payload: Payload): pass\n")
+        args, _ = args_from_annotations(tree.body[0], conn)
+        self.assertIs(args[0], _UNRESOLVABLE)
+
+    def test_args_from_annotations_without_conn_stays_unresolvable(self):
+        """No conn at all (the pre-existing call shape) — no regression either."""
+        tree = ast.parse("def handle(payload: Payload): pass\n")
+        args, _ = args_from_annotations(tree.body[0])
+        self.assertIs(args[0], _UNRESOLVABLE)
+
+    def test_mock_type_from_db_no_match_returns_unresolvable(self):
+        conn = _dep_db()
+        self.assertIs(mock_type_from_db("Payload", conn), _UNRESOLVABLE)
+
+    def test_mock_type_from_db_matches_dotted_method_node_not_bare_name(self):
+        """
+        Regression guard for the actual node shape: dep_graph never stores a class
+        under its own bare name (only "ClassName.method" for its methods), and a
+        bare-name match must not be required for detection to work.
+        """
+        conn = _dep_db()
+        with conn:
+            conn.execute(
+                "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("widgets.py::Widget.greet", "widgets.py", "Widget.greet", "structural", 4, 5, "H2"),
+            )
+        self.assertIsInstance(mock_type_from_db("Widget", conn), SyntheticMock)
+        # A bare node named exactly like a function must not be mistaken for a class.
+        with conn:
+            conn.execute(
+                "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("helpers.py::Formatter", "helpers.py", "Formatter", "structural", 1, 2, "H3"),
+            )
+        self.assertIs(mock_type_from_db("Formatter", conn), _UNRESOLVABLE)
+
+    def test_synthetic_mock_getattr_returns_none_instead_of_raising(self):
+        mock = SyntheticMock()
+        self.assertIsNone(mock.anything)
+        self.assertIsNone(mock.some_other_field_entirely)
 
     def test_snapshot_does_not_run_module_initialization(self):
         with tempfile.TemporaryDirectory() as d:
