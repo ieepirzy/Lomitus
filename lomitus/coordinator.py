@@ -164,6 +164,13 @@ CREATE TABLE IF NOT EXISTS lock_queue (
     UNIQUE(node_id, agent_id)
 );
 
+CREATE TABLE IF NOT EXISTS agent_intents (
+    agent_id    TEXT NOT NULL,
+    node_id     TEXT NOT NULL,
+    recorded_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (agent_id, node_id)
+);
+
 CREATE TABLE IF NOT EXISTS agent_traversal_nodes (
     agent_id   TEXT NOT NULL,
     node_id    TEXT NOT NULL,
@@ -192,6 +199,7 @@ CREATE INDEX IF NOT EXISTS idx_edges_from      ON edges(from_file);
 CREATE INDEX IF NOT EXISTS idx_edges_to        ON edges(to_file);
 CREATE INDEX IF NOT EXISTS idx_trav_nodes_agent ON agent_traversal_nodes(agent_id);
 CREATE INDEX IF NOT EXISTS idx_trav_edges_agent ON agent_traversal_edges(agent_id);
+CREATE INDEX IF NOT EXISTS idx_intents_node    ON agent_intents(node_id);
 """
 
 
@@ -789,6 +797,123 @@ def _dequeue_agent(node_id: str, agent_id: str, conn: sqlite3.Connection) -> Non
     conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# Deadlock resolution — preclaim consensus (wound-wait)
+#
+# See docs/design.md "Deadlock resolution — preclaim consensus": at PreToolUse,
+# before an agent is queued behind a lock conflict, it records the conflicting
+# node_ids as intents. Each attempted acquisition then BFS/DFS-walks the
+# (agent --wants--> node --held by--> agent) wait-for graph looking for a path
+# back to the requester. A cycle found there is a classical deadlock (A -> B ->
+# A, or longer): the lowest-priority agent on the cycle is wounded — its locks
+# are released and it is requeued — so the rest of the cycle can make progress.
+# ---------------------------------------------------------------------------
+
+def _find_conflicts(
+    structural_targets: list[str],
+    dep_files: set[str],
+    agent_id: str,
+    conn: sqlite3.Connection,
+) -> list[tuple[str, str]]:
+    """
+    Return (node_id, holder_agent_id) pairs for every structural target or
+    structural/external dependency node currently locked by an agent other
+    than agent_id. Single locks-table read avoids TOCTOU races.
+    """
+    current_locks: dict[str, str] = dict(conn.execute(
+        "SELECT node_id, agent_id FROM locks"
+    ).fetchall())
+
+    def held_by_other(node_id: str) -> str | None:
+        holder = current_locks.get(node_id)
+        return holder if holder and holder != agent_id else None
+
+    conflicts = [(nid, held_by_other(nid)) for nid in structural_targets]
+    conflicts = [(nid, b) for nid, b in conflicts if b]
+
+    if dep_files:
+        ph, vals = _in_clause(dep_files)
+        dep_structural = conn.execute(
+            f"SELECT node_id FROM nodes WHERE file_path IN ({ph}) AND kind IN ('structural', 'external')",
+            vals,
+        ).fetchall()
+        for (dep_nid,) in dep_structural:
+            blocker = held_by_other(dep_nid)
+            if blocker:
+                conflicts.append((dep_nid, blocker))
+    return conflicts
+
+
+def _record_intents(agent_id: str, node_ids: list[str], conn: sqlite3.Connection) -> None:
+    """Replace agent_id's recorded wait-intents with node_ids it is currently blocked on."""
+    with conn:
+        conn.execute("DELETE FROM agent_intents WHERE agent_id = ?", (agent_id,))
+        conn.executemany(
+            "INSERT OR IGNORE INTO agent_intents (agent_id, node_id) VALUES (?, ?)",
+            [(agent_id, nid) for nid in node_ids],
+        )
+
+
+def _clear_intents(agent_id: str, conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM agent_intents WHERE agent_id = ?", (agent_id,))
+    conn.commit()
+
+
+def _agent_type_of(agent_id: str, conn: sqlite3.Connection) -> str | None:
+    """An agent's type as denormalised on any lock it currently holds."""
+    row = conn.execute(
+        "SELECT agent_type FROM locks WHERE agent_id = ? LIMIT 1", (agent_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _find_wait_cycle(agent_id: str, conn: sqlite3.Connection) -> list[str] | None:
+    """
+    DFS the wait-for graph (agent --intends--> node --held by--> holder-agent)
+    for a path that leads back to agent_id. Returns the cycle as a list of
+    agent_ids starting and ending with agent_id (e.g. [A, B, A]), or None.
+
+    O(n) space for intents, O(n^2) worst case, where n is the number of
+    concurrently registered intents/locks — small in practice.
+    """
+    intents = conn.execute("SELECT agent_id, node_id FROM agent_intents").fetchall()
+    locks = dict(conn.execute("SELECT node_id, agent_id FROM locks").fetchall())
+
+    waits_for: dict[str, set[str]] = {}
+    for a, node_id in intents:
+        holder = locks.get(node_id)
+        if holder and holder != a:
+            waits_for.setdefault(a, set()).add(holder)
+
+    def dfs(node: str, path: list[str], visited: set[str]) -> list[str] | None:
+        for nxt in waits_for.get(node, ()):
+            if nxt == agent_id:
+                return path + [nxt]
+            if nxt in visited:
+                continue
+            found = dfs(nxt, path + [nxt], visited | {nxt})
+            if found:
+                return found
+        return None
+
+    return dfs(agent_id, [agent_id], {agent_id})
+
+
+def _wound(agent_id: str, conn: sqlite3.Connection) -> None:
+    """
+    Resolve agent_id's role in a detected deadlock cycle: release every lock it
+    holds (freeing the rest of the cycle to proceed) and requeue it on the
+    node_ids it was itself waiting for, preserving its position by priority.
+    """
+    intent_nodes = [r[0] for r in conn.execute(
+        "SELECT node_id FROM agent_intents WHERE agent_id = ?", (agent_id,)
+    ).fetchall()]
+    agent_type = _agent_type_of(agent_id, conn)
+    _release_agent_locks(agent_id, conn)  # also clears agent_id's own intents
+    for nid in intent_nodes:
+        _enqueue_agent(nid, agent_id, agent_type, conn)
+
+
 def _store_snapshot(
     node_id: str,
     file_path: str,
@@ -1048,34 +1173,25 @@ def handle_pretool(
     # Record this agent's traversal: nodes targeted + edges followed.
     _record_traversal(agent_id, structural_targets, file_path, dep_files, conn)
 
-    # 4. Conflict check — load the full locks table into a dict once.
-    #    Single read avoids TOCTOU races from concurrent lock acquisitions.
-    current_locks: dict[str, str] = dict(conn.execute(
-        "SELECT node_id, agent_id FROM locks"
-    ).fetchall())
+    # 4. Conflict check — single locks-table read avoids TOCTOU races from
+    #    concurrent lock acquisitions.
+    all_conflicts = _find_conflicts(structural_targets, dep_files, agent_id, conn)
 
-    def check_locked_by_other(node_id: str) -> str | None:
-        holder = current_locks.get(node_id)
-        return holder if holder and holder != agent_id else None
+    if all_conflicts:
+        # Record this agent's wait-intent and check for a wound-wait deadlock
+        # cycle before queueing/blocking (docs/design.md "Deadlock resolution").
+        _record_intents(agent_id, [nid for nid, _ in all_conflicts], conn)
+        cycle = _find_wait_cycle(agent_id, conn)
+        if cycle:
+            victim = min(
+                set(cycle), key=lambda a: (_agent_priority(_agent_type_of(a, conn)), a)
+            )
+            _wound(victim, conn)
+            if victim != agent_id:
+                # The wound may have freed the very node(s) this agent needs —
+                # recheck rather than queue/block on now-stale conflict data.
+                all_conflicts = _find_conflicts(structural_targets, dep_files, agent_id, conn)
 
-    # Check target nodes.
-    target_conflicts = [(nid, check_locked_by_other(nid)) for nid in structural_targets]
-    target_conflicts = [(nid, b) for nid, b in target_conflicts if b]
-
-    # Check structural/external nodes in direct dependencies.
-    dep_conflicts: list[tuple[str, str]] = []
-    if dep_files:
-        ph, vals = _in_clause(dep_files)
-        dep_structural = conn.execute(
-            f"SELECT node_id FROM nodes WHERE file_path IN ({ph}) AND kind IN ('structural', 'external')",
-            vals,
-        ).fetchall()
-        for (dep_nid,) in dep_structural:
-            blocker = check_locked_by_other(dep_nid)
-            if blocker:
-                dep_conflicts.append((dep_nid, blocker))
-
-    all_conflicts = target_conflicts + dep_conflicts
     if all_conflicts:
         # Check if any conflict is a cascade lock.
         cascade_detail = ""
@@ -1150,9 +1266,10 @@ def handle_pretool(
                      json.dumps(subgraph_node_hashes), f"+{ttl}", nid),
                 )
 
-    # 7. Dequeue this agent (it's now the lock holder).
+    # 7. Dequeue this agent (it's now the lock holder) and clear its wait-intent.
     for nid in structural_targets:
         _dequeue_agent(nid, agent_id, conn)
+    _clear_intents(agent_id, conn)
 
     # 8. Take I/O snapshots for contract validation at PostToolUse.
     caller_files = crawl_subgraph(file_path, depth=1, conn=conn, direction="reverse") - {file_path}
@@ -1481,9 +1598,10 @@ def handle_revert(payload: dict, conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 def _release_agent_locks(agent_id: str, conn: sqlite3.Connection) -> None:
-    """Release all locks and queue entries held by agent_id (no cache update)."""
+    """Release all locks, queue entries, and wait-intents held by agent_id (no cache update)."""
     conn.execute("DELETE FROM locks WHERE agent_id = ?", (agent_id,))
     conn.execute("DELETE FROM lock_queue WHERE agent_id = ?", (agent_id,))
+    conn.execute("DELETE FROM agent_intents WHERE agent_id = ?", (agent_id,))
     conn.commit()
 
 

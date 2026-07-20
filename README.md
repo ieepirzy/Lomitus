@@ -27,9 +27,11 @@ arguments or execution failures are recorded and skip contract comparison for th
 node. The snapshot rewriter removes initialization from the target module, but imports
 and the selected function still execute; it is process isolation, not a security sandbox.
 
-Current scalability and correctness limitations—including deadlock cycles, conservative
-multi-node targeting, and effect-classification blind spots—are listed in the
-[design document](docs/design.md#current-limitations-and-roadmap).
+Current scalability and correctness limitations—including conservative
+multi-node targeting and effect-classification blind spots—are listed in the
+[design document](docs/design.md#current-limitations-and-roadmap). Classical lock-wait
+deadlocks are detected and broken via wound-wait (see
+[Deadlock resolution — preclaim consensus](docs/design.md#deadlock-resolution--preclaim-consensus)).
 
 ## Install
 
