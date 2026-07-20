@@ -34,7 +34,10 @@ from lomitus.coordinator import (
     _cascade_trigger,
     _enqueue_agent,
     _expire_stale_locks,
+    _find_wait_cycle,
     _queue_position,
+    _record_intents,
+    _wound,
     handle_file_changed,
     handle_post_tool_batch,
     handle_pretool,
@@ -623,6 +626,123 @@ class TestPriorityQueue(unittest.TestCase):
 
             self.assertEqual(_queue_position(nid, "high", conn), 0, "orchestrator must be front")
             self.assertEqual(_queue_position(nid, "low",  conn), 1)
+
+
+# ---------------------------------------------------------------------------
+# Deadlock cycle detection (wound-wait)
+# ---------------------------------------------------------------------------
+
+class TestDeadlockCycleDetection(unittest.TestCase):
+
+    def test_no_cycle_for_simple_wait_chain(self):
+        """A waits on B; B is not waiting on anything — not a cycle."""
+        conn = _coord_db()
+        with conn:
+            conn.execute("INSERT INTO locks (node_id, file_path, agent_id) VALUES ('n2','f2','B')")
+        _record_intents("A", ["n2"], conn)
+        self.assertIsNone(_find_wait_cycle("A", conn))
+
+    def test_two_agent_cycle_detected(self):
+        """A holds n1 and waits on n2 (held by B); B holds n2 and waits on n1 (held by A)."""
+        conn = _coord_db()
+        with conn:
+            conn.execute("INSERT INTO locks (node_id, file_path, agent_id) VALUES ('n1','f1','A')")
+            conn.execute("INSERT INTO locks (node_id, file_path, agent_id) VALUES ('n2','f2','B')")
+        _record_intents("A", ["n2"], conn)
+        _record_intents("B", ["n1"], conn)
+        cycle = _find_wait_cycle("B", conn)
+        self.assertIsNotNone(cycle)
+        self.assertEqual(set(cycle), {"A", "B"})
+
+    def test_three_agent_cycle_detected(self):
+        """A -> B -> C -> A wait-for ring."""
+        conn = _coord_db()
+        with conn:
+            conn.execute("INSERT INTO locks (node_id, file_path, agent_id) VALUES ('n1','f1','A')")
+            conn.execute("INSERT INTO locks (node_id, file_path, agent_id) VALUES ('n2','f2','B')")
+            conn.execute("INSERT INTO locks (node_id, file_path, agent_id) VALUES ('n3','f3','C')")
+        _record_intents("A", ["n2"], conn)  # A waits on B
+        _record_intents("B", ["n3"], conn)  # B waits on C
+        cycle = _find_wait_cycle("C", conn)
+        self.assertIsNone(cycle, "cycle not yet closed — C has no recorded intent")
+        _record_intents("C", ["n1"], conn)  # C waits on A — closes the ring
+        cycle = _find_wait_cycle("C", conn)
+        self.assertIsNotNone(cycle)
+        self.assertEqual(set(cycle), {"A", "B", "C"})
+
+    def test_wound_releases_locks_and_requeues(self):
+        conn = _coord_db()
+        with conn:
+            conn.execute("INSERT INTO locks (node_id, file_path, agent_id, agent_type) "
+                         "VALUES ('n1','f1','victim','worker')")
+        _record_intents("victim", ["n2"], conn)
+        _wound("victim", conn)
+        self.assertIsNone(
+            conn.execute("SELECT 1 FROM locks WHERE agent_id='victim'").fetchone(),
+            "wounded agent's locks must be released",
+        )
+        self.assertIsNone(
+            conn.execute("SELECT 1 FROM agent_intents WHERE agent_id='victim'").fetchone(),
+            "wounded agent's intents must be cleared",
+        )
+        self.assertIsNotNone(
+            conn.execute(
+                "SELECT 1 FROM lock_queue WHERE agent_id='victim' AND node_id='n2'"
+            ).fetchone(),
+            "wounded agent must be requeued on the node it was waiting for",
+        )
+
+    def test_end_to_end_two_agent_deadlock_resolves_lower_priority(self):
+        """
+        Agent H (orchestrator) holds foo(), wants bar().
+        Agent L (default priority) holds bar(), wants foo().
+        Classical A-holds-foo/needs-bar + B-holds-bar/needs-foo deadlock from
+        docs/design.md. L (lower priority) must be wounded so H can proceed.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            f1 = Path(d) / "foo_mod.py"
+            f2 = Path(d) / "bar_mod.py"
+            f1.write_text("def foo(): pass\n")
+            f2.write_text("def bar(): pass\n")
+            conn = _coord_db()
+
+            # H acquires foo(), L acquires bar() — no conflict yet.
+            self.assertEqual(
+                _pretool(conn, f1, "H", "def foo(): pass", "def foo(): return 1",
+                         agent_type="orchestrator"),
+                0,
+            )
+            self.assertEqual(
+                _pretool(conn, f2, "L", "def bar(): pass", "def bar(): return 1"),
+                0,
+            )
+
+            # H wants bar() (held by L) — blocked, H's wait-intent recorded.
+            self.assertEqual(
+                _pretool(conn, f2, "H", "def bar(): pass", "def bar(): return 2",
+                         agent_type="orchestrator"),
+                2,
+            )
+
+            # L wants foo() (held by H) — closes the ring. L is lower priority
+            # and must be wounded: its lock on bar() releases so H can proceed.
+            self.assertEqual(
+                _pretool(conn, f1, "L", "def foo(): pass", "def foo(): return 2"),
+                2,
+                "the wounded (lower-priority) agent still replans this turn",
+            )
+            self.assertIsNone(
+                conn.execute("SELECT 1 FROM locks WHERE agent_id='L'").fetchone(),
+                "L's lock on bar() must have been released by the wound",
+            )
+
+            # H retries bar() — now free — and must succeed.
+            self.assertEqual(
+                _pretool(conn, f2, "H", "def bar(): pass", "def bar(): return 2",
+                         agent_type="orchestrator"),
+                0,
+                "H must be able to proceed once the deadlock is broken",
+            )
 
 
 # ---------------------------------------------------------------------------

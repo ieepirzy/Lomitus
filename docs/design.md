@@ -294,7 +294,7 @@ The same parse and crawl serves both subgraph hash comparison (drift detection) 
 
 A `lock_queue` table holds requests that arrive while a target node is already locked. Priority tiers are stored in the `agents` table (`orchestrator=100`, `senior/lead=80`, default=0). Queued agents are processed in priority order when the lock is released.
 
-> **Known gap — classical deadlock:** The priority queue provides ordering but has no cycle detection. Agent A holding `foo()` and needing `bar()` while Agent B holds `bar()` and needs `foo()` will deadlock permanently. See [Current limitations and roadmap](#current-limitations-and-roadmap) for the suggested fix.
+The priority queue on its own provides ordering but not cycle detection — a classical deadlock (Agent A holding `foo()` and needing `bar()` while Agent B holds `bar()` and needs `foo()`) would deadlock permanently without it. See [Deadlock resolution — preclaim consensus](#deadlock-resolution--preclaim-consensus) below for the implemented cycle-breaking mechanism.
 
 ---
 
@@ -359,13 +359,13 @@ The cascade records coordinator-observed contract updates. It reduces the chance
 
 Classical deadlock: Agent A holds a lock on `foo()` and needs `bar()`. Agent B holds `bar()` and needs `foo()`. Both wait forever.
 
-The priority queue provides ordering when agents queue for the same node, but it does not detect cycles across distinct nodes. Classical deadlock (A→B→A in the lock-wait graph) is a known gap. The suggested fix is wound-wait:
+The priority queue provides ordering when agents queue for the same node, but on its own it does not detect cycles across distinct nodes — classical deadlock (A→B→A in the lock-wait graph) needs a separate check. **Implemented** as wound-wait:
 
-1. Add an `agent_intents` table. At PreToolUse, before acquiring a lock, write the target `node_id` as an intent.
-2. On each lock acquisition attempt, BFS the `(node_id → agent_id → intents)` graph for cycles.
-3. On cycle detected, wound the lower-priority agent: release its held locks, requeue it, allow the higher-priority agent to proceed.
+1. An `agent_intents` table (`agent_id`, `node_id`) records, at PreToolUse, every conflicting node_id an agent is currently blocked on — the set it was about to queue behind.
+2. Before queueing/blocking on a conflict, the coordinator DFS-walks the `(agent → node → holder-agent)` wait-for graph built from `agent_intents` joined against current `locks`, looking for a path back to the requesting agent.
+3. On cycle detected, the lowest-priority agent among the cycle's members is wounded: `_release_agent_locks()` drops every lock and intent it holds, and it is requeued (`lock_queue`) on the node it was itself waiting for. If the wounded agent isn't the current requester, conflicts are rechecked immediately — the wound may have freed exactly the node this call needed.
 
-This is O(n) space for intent tracking, O(n²) worst case for cycle detection, where n is the number of concurrent agents — small in practice.
+This is O(n) space for intent tracking, O(n²) worst case for cycle detection, where n is the number of concurrent agents — small in practice. See `lomitus/coordinator.py` (`_find_wait_cycle`, `_wound`) and `tests/test_unit.py`'s `TestDeadlockCycleDetection`.
 
 ### Crash recovery — TTL revert
 
@@ -449,10 +449,6 @@ def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection | None) -> 
 ### In-memory graph cache for high agent counts
 
 At 100+ concurrent agents, `crawl_subgraph()` BFS traversals hit SQLite on every hop. At scale, loading the `edges` table into a `dict[str, set[str]]` at SessionStart and keeping it warm via incremental updates would reduce BFS to pure dict lookups.
-
-### Deadlock cycle detection
-
-Documented in [v2 — Deadlock resolution](#deadlock-resolution--preclaim-consensus). The `lock_queue` priority queue provides ordering but not cycle detection. The wound-wait approach (add `agent_intents` table, BFS lock-wait graph before each acquisition, wound lower-priority agent on cycle) is the concrete suggested fix.
 
 ### Multi-match target collateral
 
