@@ -410,6 +410,24 @@ def index_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> N
         )
 
 
+# Conservative batch size for IN-clause queries: SQLite's bound-parameter limit
+# (SQLITE_MAX_VARIABLE_NUMBER) is 999 on builds compiled before 3.32.0 and much
+# higher on newer ones. Chunking at 500 stays well under either.
+_QUERY_BATCH_SIZE = 500
+
+
+def _fetch_neighbors_batched(conn: sqlite3.Connection, query: str, values: list[str]) -> set[str]:
+    """Run `query` (containing one '{}' IN-clause placeholder block) over `values`,
+    chunking so the bound-parameter count never exceeds _QUERY_BATCH_SIZE."""
+    result: set[str] = set()
+    for i in range(0, len(values), _QUERY_BATCH_SIZE):
+        chunk = values[i : i + _QUERY_BATCH_SIZE]
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(query.format(placeholders), chunk).fetchall()
+        result.update(r[0] for r in rows)
+    return result
+
+
 def crawl_subgraph(
     start_file: str,
     depth: int,
@@ -422,20 +440,28 @@ def crawl_subgraph(
     reverse  — files that depend on this file
     both     — full neighbourhood
     Returns the set of absolute file paths including start_file.
+
+    Issues one (batched) query per direction per depth level rather than one
+    query per frontier file, so a wide frontier costs O(depth) round trips
+    instead of O(depth * frontier size) — the hot path at high concurrent
+    agent counts, where every PreToolUse/PostToolUse hook is a fresh process
+    hitting the shared coordinator DB.
     """
     start = str(Path(start_file).resolve())
     visited: set[str] = {start}
     frontier: set[str] = {start}
 
     for _ in range(depth):
+        frontier_list = list(frontier)
         next_frontier: set[str] = set()
-        for f in frontier:
-            if direction in ("forward", "both"):
-                rows = conn.execute("SELECT to_file FROM edges WHERE from_file = ?", (f,)).fetchall()
-                next_frontier.update(r[0] for r in rows)
-            if direction in ("reverse", "both"):
-                rows = conn.execute("SELECT from_file FROM edges WHERE to_file = ?", (f,)).fetchall()
-                next_frontier.update(r[0] for r in rows)
+        if direction in ("forward", "both"):
+            next_frontier |= _fetch_neighbors_batched(
+                conn, "SELECT to_file FROM edges WHERE from_file IN ({})", frontier_list
+            )
+        if direction in ("reverse", "both"):
+            next_frontier |= _fetch_neighbors_batched(
+                conn, "SELECT from_file FROM edges WHERE to_file IN ({})", frontier_list
+            )
         next_frontier -= visited
         if not next_frontier:
             break

@@ -47,7 +47,7 @@ from lomitus.coordinator import (
     handle_subagent_stop,
     _migrate,
 )
-from lomitus.dep_graph import SCHEMA as DEP_SCHEMA, index_file, is_fresh, update_file
+from lomitus.dep_graph import SCHEMA as DEP_SCHEMA, crawl_subgraph, index_file, is_fresh, update_file
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +302,78 @@ class TestDepGraph(unittest.TestCase):
 
             row = conn.execute("SELECT kind FROM nodes WHERE name='use'").fetchone()
             self.assertEqual(row[0], "external", "dependent must be re-classified after lib's kind changes")
+
+
+# ---------------------------------------------------------------------------
+# crawl_subgraph
+# ---------------------------------------------------------------------------
+
+def _edge(conn: sqlite3.Connection, from_file: str, to_file: str) -> None:
+    conn.execute("INSERT OR IGNORE INTO edges (from_file, to_file) VALUES (?, ?)", (from_file, to_file))
+
+
+class TestCrawlSubgraph(unittest.TestCase):
+    """crawl_subgraph had no direct unit coverage before the batched-query
+    rewrite (see docs/design.md 'In-memory graph cache for high agent
+    counts'); these lock down BFS semantics across the rewrite."""
+
+    def test_forward_respects_depth_limit(self):
+        with tempfile.TemporaryDirectory() as d:
+            start = str(Path(d) / "a.py")
+            conn = _dep_db()
+            _edge(conn, start, "/proj/b.py")
+            _edge(conn, "/proj/b.py", "/proj/c.py")
+            _edge(conn, "/proj/c.py", "/proj/d.py")
+            result = crawl_subgraph(start, depth=2, conn=conn, direction="forward")
+            self.assertEqual(result, {start, "/proj/b.py", "/proj/c.py"})
+
+    def test_reverse_follows_incoming_edges(self):
+        with tempfile.TemporaryDirectory() as d:
+            start = str(Path(d) / "lib.py")
+            conn = _dep_db()
+            _edge(conn, "/proj/caller.py", start)
+            result = crawl_subgraph(start, depth=1, conn=conn, direction="reverse")
+            self.assertEqual(result, {start, "/proj/caller.py"})
+            # forward from the same start must not pick up the incoming edge
+            self.assertEqual(crawl_subgraph(start, depth=1, conn=conn, direction="forward"), {start})
+
+    def test_both_combines_forward_and_reverse(self):
+        with tempfile.TemporaryDirectory() as d:
+            start = str(Path(d) / "mid.py")
+            conn = _dep_db()
+            _edge(conn, start, "/proj/dep.py")
+            _edge(conn, "/proj/caller.py", start)
+            result = crawl_subgraph(start, depth=1, conn=conn, direction="both")
+            self.assertEqual(result, {start, "/proj/dep.py", "/proj/caller.py"})
+
+    def test_cycle_terminates_and_excludes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            start = str(Path(d) / "a.py")
+            conn = _dep_db()
+            _edge(conn, start, "/proj/b.py")
+            _edge(conn, "/proj/b.py", start)
+            result = crawl_subgraph(start, depth=5, conn=conn, direction="forward")
+            self.assertEqual(result, {start, "/proj/b.py"})
+
+    def test_wide_frontier_beyond_batch_size_is_not_truncated(self):
+        # Exercises the chunking added for SQLite's bound-parameter limit:
+        # a frontier larger than the internal batch size must still return
+        # every neighbor, not just the first chunk's worth.
+        with tempfile.TemporaryDirectory() as d:
+            start = str(Path(d) / "hub.py")
+            conn = _dep_db()
+            targets = [f"/proj/leaf{i}.py" for i in range(1200)]
+            for target in targets:
+                _edge(conn, start, target)
+            result = crawl_subgraph(start, depth=1, conn=conn, direction="forward")
+            self.assertEqual(result, {start, *targets})
+
+    def test_no_edges_returns_only_start(self):
+        with tempfile.TemporaryDirectory() as d:
+            start = str(Path(d) / "isolated.py")
+            conn = _dep_db()
+            result = crawl_subgraph(start, depth=3, conn=conn, direction="both")
+            self.assertEqual(result, {start})
 
 
 # ---------------------------------------------------------------------------

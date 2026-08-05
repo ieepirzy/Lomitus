@@ -446,9 +446,11 @@ def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection | None) -> 
 
 **Known gap:** a project-defined class with no explicit methods at all (e.g. a bare-field dataclass with only field annotations) produces no indexed node under this scheme and is therefore still unresolvable — narrower than the original "any `ClassDef`" framing. Fixing this fully would mean indexing classes themselves as nodes, which has its own tradeoffs (see the false-positive-drift rationale in `dep_graph._all_stmts`) and is left as further work.
 
-### In-memory graph cache for high agent counts
+### In-memory graph cache for high agent counts (partially implemented)
 
-At 100+ concurrent agents, `crawl_subgraph()` BFS traversals hit SQLite on every hop. At scale, loading the `edges` table into a `dict[str, set[str]]` at SessionStart and keeping it warm via incremental updates would reduce BFS to pure dict lookups.
+At 100+ concurrent agents, `crawl_subgraph()` BFS traversals hit SQLite on every hop. The original idea here — loading the `edges` table into a `dict[str, set[str]]` at `SessionStart` and keeping it warm via incremental updates — does not fit the current architecture: `coordinator.py` is a fresh, short-lived process per hook invocation (see "The coordinator is a deterministic service... invoked via Claude Code's PreToolUse and PostToolUse hooks" above), with no persistent process to hold the dict across calls. `watchdog.py` is the only long-running process today, and it only sweeps TTL-expired locks — it does not serve graph queries. Building the literal in-process cache would require introducing a persistent coordinator daemon that hook invocations talk to (socket/IPC), which is a real architectural decision (daemon lifecycle, crash recovery, per-worktree DB routing) and not a drop-in change.
+
+What's implemented instead: `crawl_subgraph()` now issues one batched `IN (...)` query per direction per depth level instead of one query per frontier file, cutting per-crawl round trips from O(depth × frontier size) to O(depth). This reduces SQLite contention at the source (fewer queries against the shared WAL-mode DB) without requiring cross-process state. The daemon-backed in-memory cache remains open as further work if profiling shows the batched-query version still isn't enough at scale.
 
 ### Multi-match target collateral
 
