@@ -40,6 +40,128 @@ CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_file);
 CREATE INDEX IF NOT EXISTS idx_edges_to   ON edges(to_file);
 """
 
+class _EdgeCache:
+    """
+    In-memory mirror of the `edges` table for one sqlite3.Connection.
+
+    forward[a] = files that `a` imports        (from_file -> {to_file, ...})
+    reverse[a] = files that import `a`          (to_file   -> {from_file, ...})
+    """
+    __slots__ = ("forward", "reverse")
+
+    def __init__(self) -> None:
+        self.forward: dict[str, set[str]] = {}
+        self.reverse: dict[str, set[str]] = {}
+
+
+# One cache per live sqlite3.Connection, for the lifetime of the process.
+#
+# docs/design.md's "In-memory graph cache" note frames this as "load at
+# SessionStart, keep warm via incremental updates" — but SessionStart in this
+# codebase is itself just another short-lived `lomitus hook --session-start`
+# subprocess invocation (see coordinator.py's main(): one process per hook
+# event, exits after handling it). There is no resident coordinator process
+# for a dict populated at SessionStart to stay warm in across later hook
+# calls; only the SQLite DB persists across invocations. So population here
+# is lazy-on-first-use *within* a process (typically the first crawl_subgraph()
+# call in a PreToolUse/FileChanged/etc. handler) rather than eager-at-
+# SessionStart, and the cache is scoped to the sqlite3.Connection object that
+# process is using. Once created it is kept warm incrementally by
+# index_file()/update_file() for the rest of that connection's life — the
+# only two functions that write to `edges` anywhere in this codebase.
+#
+# sqlite3.Connection objects support neither custom attributes nor weakref
+# (both raise TypeError/AttributeError), so identity is tracked via id()
+# with a *strong* reference to the connection held alongside its cache. That
+# strong reference pins the connection in memory for as long as its cache
+# entry exists, which is what makes id()-keying safe here: id() can only be
+# recycled onto an unrelated object once the original is garbage collected,
+# and this dict prevents that. The cost is that connections registered here
+# are kept alive for the life of the process — a non-issue for production
+# (one connection per short-lived hook process) and an acceptable, bounded
+# cost for a test suite that creates many `:memory:` connections.
+_edge_cache_registry: dict[int, tuple[sqlite3.Connection, _EdgeCache]] = {}
+
+
+def _load_edge_cache(conn: sqlite3.Connection) -> _EdgeCache:
+    cache = _EdgeCache()
+    for from_file, to_file in conn.execute("SELECT from_file, to_file FROM edges").fetchall():
+        cache.forward.setdefault(from_file, set()).add(to_file)
+        cache.reverse.setdefault(to_file, set()).add(from_file)
+    return cache
+
+
+def _get_edge_cache(conn: sqlite3.Connection) -> _EdgeCache:
+    """Return the warm in-memory edge cache for `conn`, loading it from the
+    `edges` table on first use for this connection."""
+    entry = _edge_cache_registry.get(id(conn))
+    if entry is not None and entry[0] is conn:
+        return entry[1]
+    cache = _load_edge_cache(conn)
+    _edge_cache_registry[id(conn)] = (conn, cache)
+    return cache
+
+
+def _edge_cache_if_active(conn: sqlite3.Connection) -> _EdgeCache | None:
+    """
+    Like _get_edge_cache, but never triggers a load — returns None if no cache
+    has been established yet for `conn`. Write paths use this so a process
+    that never calls crawl_subgraph() never pays for a table load it doesn't
+    need; the first crawl_subgraph() call in such a process still loads a
+    fully current snapshot straight from SQLite (same connection => it always
+    sees its own prior writes), so this is never a source of staleness.
+    """
+    entry = _edge_cache_registry.get(id(conn))
+    if entry is not None and entry[0] is conn:
+        return entry[1]
+    return None
+
+
+def invalidate_edge_cache(conn: sqlite3.Connection) -> None:
+    """
+    Drop any cached edge graph for `conn`, forcing the next crawl_subgraph()
+    call to reload fresh from SQLite. A conservative fallback for any future
+    edge-mutating code path that cannot cheaply patch the cache in place —
+    prefer this over letting the cache silently drift from the DB.
+    """
+    _edge_cache_registry.pop(id(conn), None)
+
+
+def _cache_replace_outbound(cache: _EdgeCache, from_file: str, new_targets: set[str]) -> None:
+    """
+    Patch the cache to mirror index_file()'s write pattern:
+    `DELETE FROM edges WHERE from_file=?` followed by inserting
+    (from_file, to) for each `to` in new_targets.
+    """
+    old_targets = cache.forward.pop(from_file, set())
+    for stale in old_targets - new_targets:
+        inbound = cache.reverse.get(stale)
+        if inbound is not None:
+            inbound.discard(from_file)
+            if not inbound:
+                del cache.reverse[stale]
+    if new_targets:
+        cache.forward[from_file] = set(new_targets)
+        for target in new_targets:
+            cache.reverse.setdefault(target, set()).add(from_file)
+
+
+def _cache_remove_file(cache: _EdgeCache, file_path: str) -> None:
+    """
+    Patch the cache to mirror update_file()'s file-deleted branch:
+    `DELETE FROM edges WHERE from_file=? OR to_file=?` — purge every edge
+    touching file_path in either direction.
+    """
+    _cache_replace_outbound(cache, file_path, set())
+    inbound_sources = list(cache.reverse.pop(file_path, set()))
+    for source in inbound_sources:
+        outbound = cache.forward.get(source)
+        if outbound is not None:
+            outbound.discard(file_path)
+            if not outbound:
+                del cache.forward[source]
+
+
 @dataclass(frozen=True)
 class Node:
     node_id: str
@@ -409,6 +531,10 @@ def index_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> N
             edges,
         )
 
+    cache = _edge_cache_if_active(conn)
+    if cache is not None:
+        _cache_replace_outbound(cache, abs_path, {target for _, target in edges})
+
 
 def crawl_subgraph(
     start_file: str,
@@ -422,20 +548,24 @@ def crawl_subgraph(
     reverse  — files that depend on this file
     both     — full neighbourhood
     Returns the set of absolute file paths including start_file.
+
+    Served entirely from the in-memory edge cache (see _EdgeCache) instead of
+    one SQLite query per hop — the cache is loaded from the `edges` table on
+    first use for `conn` and kept warm incrementally by index_file() /
+    update_file() afterward, so BFS here is pure dict lookups.
     """
     start = str(Path(start_file).resolve())
     visited: set[str] = {start}
     frontier: set[str] = {start}
+    cache = _get_edge_cache(conn)
 
     for _ in range(depth):
         next_frontier: set[str] = set()
         for f in frontier:
             if direction in ("forward", "both"):
-                rows = conn.execute("SELECT to_file FROM edges WHERE from_file = ?", (f,)).fetchall()
-                next_frontier.update(r[0] for r in rows)
+                next_frontier.update(cache.forward.get(f, ()))
             if direction in ("reverse", "both"):
-                rows = conn.execute("SELECT from_file FROM edges WHERE to_file = ?", (f,)).fetchall()
-                next_frontier.update(r[0] for r in rows)
+                next_frontier.update(cache.reverse.get(f, ()))
         next_frontier -= visited
         if not next_frontier:
             break
@@ -496,6 +626,9 @@ def update_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> 
         with conn:
             conn.execute("DELETE FROM nodes WHERE file_path = ?", (abs_path,))
             conn.execute("DELETE FROM edges WHERE from_file = ? OR to_file = ?", (abs_path, abs_path))
+        cache = _edge_cache_if_active(conn)
+        if cache is not None:
+            _cache_remove_file(cache, abs_path)
         for dep in dependent_files:
             if Path(dep).is_file():
                 try:

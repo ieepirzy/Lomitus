@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from lomitus.contract import (
     _MockArg,
@@ -47,7 +48,14 @@ from lomitus.coordinator import (
     handle_subagent_stop,
     _migrate,
 )
-from lomitus.dep_graph import SCHEMA as DEP_SCHEMA, index_file, is_fresh, update_file
+from lomitus import dep_graph
+from lomitus.dep_graph import (
+    SCHEMA as DEP_SCHEMA,
+    crawl_subgraph,
+    index_file,
+    is_fresh,
+    update_file,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +310,159 @@ class TestDepGraph(unittest.TestCase):
 
             row = conn.execute("SELECT kind FROM nodes WHERE name='use'").fetchone()
             self.assertEqual(row[0], "external", "dependent must be re-classified after lib's kind changes")
+
+
+# ---------------------------------------------------------------------------
+# In-memory edge-graph cache (crawl_subgraph) — docs/design.md
+# "In-memory graph cache for high agent counts"
+# ---------------------------------------------------------------------------
+
+def _sqlite_bfs_reference(
+    start_file: str, depth: int, conn: sqlite3.Connection, direction: str = "forward"
+) -> set[str]:
+    """
+    Reference BFS identical to crawl_subgraph()'s pre-cache implementation —
+    one SQLite query per hop, no in-memory cache involved. Used only to prove
+    the cache-backed implementation returns identical results.
+    """
+    start = str(Path(start_file).resolve())
+    visited: set[str] = {start}
+    frontier: set[str] = {start}
+    for _ in range(depth):
+        next_frontier: set[str] = set()
+        for f in frontier:
+            if direction in ("forward", "both"):
+                rows = conn.execute("SELECT to_file FROM edges WHERE from_file = ?", (f,)).fetchall()
+                next_frontier.update(r[0] for r in rows)
+            if direction in ("reverse", "both"):
+                rows = conn.execute("SELECT from_file FROM edges WHERE to_file = ?", (f,)).fetchall()
+                next_frontier.update(r[0] for r in rows)
+        next_frontier -= visited
+        if not next_frontier:
+            break
+        visited |= next_frontier
+        frontier = next_frontier
+    return visited
+
+
+class TestEdgeGraphCache(unittest.TestCase):
+
+    def _build_chain(self, d: Path):
+        # Import chain a -> b -> c -> dd, plus an unrelated file e with no edges.
+        a, b, c, dd, e = (d / f"{n}.py" for n in "abcde")
+        a.write_text("from b import y\n")
+        b.write_text("from c import z\ndef y(): pass\n")
+        c.write_text(f"from {dd.stem} import w\ndef z(): pass\n")
+        dd.write_text("def w(): pass\n")
+        e.write_text("def standalone(): pass\n")
+        return a, b, c, dd, e
+
+    def test_matches_sqlite_reference_bfs(self):
+        """The cache-backed crawl_subgraph() must return results identical to
+        a plain per-hop SQLite BFS over the same graph, for every direction
+        and a range of depths (including depth 0 and depths beyond the
+        graph's diameter)."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            a, b, c, dd, e = self._build_chain(d)
+            conn = _dep_db()
+            for f in (a, b, c, dd, e):
+                index_file(str(f), str(d), conn)
+
+            for direction in ("forward", "reverse", "both"):
+                for depth in (0, 1, 2, 3, 5):
+                    cached = crawl_subgraph(str(a), depth, conn, direction=direction)
+                    reference = _sqlite_bfs_reference(str(a), depth, conn, direction=direction)
+                    self.assertEqual(
+                        cached, reference,
+                        f"cache-backed BFS diverged from SQLite reference "
+                        f"(direction={direction}, depth={depth})",
+                    )
+
+    def test_write_reflected_without_full_reload(self):
+        """An edge write via index_file() after the cache is already warm
+        must be visible on the next crawl_subgraph() call — and must get
+        there by patching the cache in place, not by falling back to a full
+        table reload (asserted via a call-count spy on the loader)."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            a, b, c, dd, e = self._build_chain(d)
+            conn = _dep_db()
+            for f in (a, b, c, dd, e):
+                index_file(str(f), str(d), conn)
+
+            with mock.patch.object(
+                dep_graph, "_load_edge_cache", wraps=dep_graph._load_edge_cache
+            ) as spy_load:
+                # First crawl populates the cache — exactly one full load.
+                result = crawl_subgraph(str(a), depth=1, conn=conn, direction="forward")
+                self.assertEqual(result, {str(a.resolve()), str(b.resolve())})
+                self.assertEqual(spy_load.call_count, 1)
+
+                # Rewrite a.py to import e instead of b, and re-index — the
+                # write path (index_file) must patch the cache incrementally.
+                a.write_text("from e import standalone\n")
+                index_file(str(a), str(d), conn)
+
+                result_after = crawl_subgraph(str(a), depth=1, conn=conn, direction="forward")
+                self.assertEqual(
+                    result_after, {str(a.resolve()), str(e.resolve())},
+                    "edge write must be reflected by the next crawl_subgraph() call",
+                )
+                self.assertNotIn(str(b.resolve()), result_after)
+
+                # No additional full-table reload happened: proves the write
+                # path updated the cache incrementally rather than reloading.
+                self.assertEqual(
+                    spy_load.call_count, 1,
+                    "edge cache must be kept warm incrementally, not via reload-on-write",
+                )
+
+    def test_file_delete_purges_cache_without_full_reload(self):
+        """update_file()'s file-deleted branch is the other write path to the
+        `edges` table; its cache patch must also be incremental."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            a, b, c, dd, e = self._build_chain(d)
+            conn = _dep_db()
+            for f in (a, b, c, dd, e):
+                index_file(str(f), str(d), conn)
+
+            with mock.patch.object(
+                dep_graph, "_load_edge_cache", wraps=dep_graph._load_edge_cache
+            ) as spy_load:
+                result = crawl_subgraph(str(b), depth=1, conn=conn, direction="reverse")
+                self.assertIn(str(a.resolve()), result)
+                self.assertEqual(spy_load.call_count, 1)
+
+                b.unlink()
+                update_file(str(b), str(d), conn)
+
+                result_after = crawl_subgraph(str(b), depth=1, conn=conn, direction="reverse")
+                self.assertEqual(
+                    result_after, {str(b.resolve())},
+                    "edge removal on file delete must be reflected without a full reload",
+                )
+                self.assertEqual(spy_load.call_count, 1)
+
+    def test_cache_is_isolated_per_connection(self):
+        """A distinct sqlite3.Connection (e.g. a different test's :memory: DB)
+        must never see another connection's cached edges."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            a, b, c, dd, e = self._build_chain(d)
+            conn1 = _dep_db()
+            for f in (a, b, c, dd, e):
+                index_file(str(f), str(d), conn1)
+            crawl_subgraph(str(a), depth=1, conn=conn1, direction="forward")
+
+            conn2 = _dep_db()  # separate :memory: DB with an empty edges table
+            result2 = crawl_subgraph(str(a), depth=1, conn=conn2, direction="forward")
+            self.assertEqual(
+                result2, {str(a.resolve())},
+                "a fresh connection with an empty edges table must not see another "
+                "connection's cached edges",
+            )
 
 
 # ---------------------------------------------------------------------------

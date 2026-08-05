@@ -446,9 +446,11 @@ def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection | None) -> 
 
 **Known gap:** a project-defined class with no explicit methods at all (e.g. a bare-field dataclass with only field annotations) produces no indexed node under this scheme and is therefore still unresolvable — narrower than the original "any `ClassDef`" framing. Fixing this fully would mean indexing classes themselves as nodes, which has its own tradeoffs (see the false-positive-drift rationale in `dep_graph._all_stmts`) and is left as further work.
 
-### In-memory graph cache for high agent counts
+### In-memory graph cache for high agent counts (implemented)
 
-At 100+ concurrent agents, `crawl_subgraph()` BFS traversals hit SQLite on every hop. At scale, loading the `edges` table into a `dict[str, set[str]]` at SessionStart and keeping it warm via incremental updates would reduce BFS to pure dict lookups.
+At 100+ concurrent agents, `crawl_subgraph()` BFS traversals hit SQLite on every hop. `crawl_subgraph()` now serves BFS from an in-memory `dict[str, set[str]]` mirror of the `edges` table (forward and reverse adjacency) instead of one query per hop.
+
+One adaptation from the original framing: the coordinator has no resident process for a cache populated "at SessionStart" to stay warm in. `SessionStart` is itself just another short-lived `lomitus hook --session-start` subprocess (see `coordinator.py`'s `main()` — one process per hook event, exits after handling it); only the SQLite DB persists across invocations. So the cache is populated lazily on first use within a process and scoped to that process's `sqlite3.Connection` object, rather than eagerly at SessionStart. It is kept warm incrementally — never a full reload — by `index_file()` and `update_file()`, the only two functions anywhere in the codebase that write to `edges`. See `dep_graph._EdgeCache` / `_get_edge_cache` / `_cache_replace_outbound` / `_cache_remove_file`, and `tests/test_unit.py`'s `TestEdgeGraphCache`.
 
 ### Multi-match target collateral
 
