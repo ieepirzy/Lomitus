@@ -73,8 +73,9 @@ def index_project(
     """
     Index every Python file under project_root into conn (a fresh in-memory
     DB by default) and return it. Effect typing crosses one file boundary per
-    pass, so it re-indexes until no node's kind changes, at most
-    `effect_passes` times. Files that don't parse are skipped: they have no
+    pass, so after the full first pass it re-indexes only the importers of
+    files whose kinds could have changed, until nothing changes, for at most
+    `effect_passes` passes in all. Files that don't parse are skipped: they have no
     nodes and no outgoing edges (a consumer should treat a change to one as
     "run everything").
     """
@@ -83,25 +84,49 @@ def index_project(
         conn = sqlite3.connect(":memory:")
     conn.executescript(dg.SCHEMA)
     files = _python_files(root, frozenset(exclude))
+    file_set = set(files)
+
+    def index(batch: Iterable[str]) -> None:
+        for f in batch:
+            try:
+                dg.index_file(f, str(root), conn)
+            except (SyntaxError, UnicodeDecodeError, ValueError):
+                with conn:
+                    conn.execute("DELETE FROM nodes WHERE file_path = ?", (f,))
+                    conn.execute("DELETE FROM edges WHERE from_file = ?", (f,))
+
+    def kinds_by_file() -> dict[str, frozenset[tuple[str, str]]]:
+        out: dict[str, set[tuple[str, str]]] = {}
+        for f, nid, k in conn.execute("SELECT file_path, node_id, kind FROM nodes"):
+            out.setdefault(f, set()).add((nid, k))
+        return {f: frozenset(v) for f, v in out.items()}
+
     dg._resolve_memo.clear()
+    dg._parse_memo.clear()
     dg._memo_held = True
     try:
-        previous: dict[str, str] | None = None
-        for _ in range(max(1, effect_passes)):
-            for f in files:
-                try:
-                    dg.index_file(f, str(root), conn)
-                except (SyntaxError, UnicodeDecodeError, ValueError):
-                    with conn:
-                        conn.execute("DELETE FROM nodes WHERE file_path = ?", (f,))
-                        conn.execute("DELETE FROM edges WHERE from_file = ?", (f,))
-            kinds = dict(conn.execute("SELECT node_id, kind FROM nodes").fetchall())
-            if kinds == previous:
+        index(files)
+        # A file indexed before a file it imports saw no kinds there yet, and
+        # only "external" lookups matter. So the second pass re-indexes the
+        # importers of files with an external node; later passes, the
+        # importers of files whose kinds changed in the pass before.
+        sources = {r[0] for r in conn.execute("SELECT DISTINCT file_path FROM nodes WHERE kind = 'external'")}
+        for _ in range(max(0, effect_passes - 1)):
+            if not sources:
                 break
-            previous = kinds
+            dirty = dg._fetch_neighbors_batched(
+                conn, "SELECT from_file FROM edges WHERE to_file IN ({})", sorted(sources)
+            ) & file_set
+            if not dirty:
+                break
+            before = kinds_by_file()
+            index(sorted(dirty))
+            after = kinds_by_file()
+            sources = {f for f in dirty if before.get(f) != after.get(f)}
     finally:
         dg._memo_held = False
         dg._resolve_memo.clear()
+        dg._parse_memo.clear()
     return conn
 
 

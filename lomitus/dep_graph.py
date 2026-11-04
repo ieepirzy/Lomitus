@@ -750,9 +750,20 @@ def _lookup_kind(conn: sqlite3.Connection, file_path: str, name: str) -> str | N
     return row[0] if row else None
 
 
+_parse_memo: dict[str, tuple[str, ast.Module]] = {}
+
+
 def _parse(file_path: str) -> tuple[str, ast.Module]:
+    # Inside a batch (index_files / lomitus.impact.index_project, which hold
+    # the memo) files don't change, so later effect-typing passes reuse the
+    # parse. Outside one, always read the file fresh.
+    if _memo_held and file_path in _parse_memo:
+        return _parse_memo[file_path]
     source = Path(file_path).read_text(encoding="utf-8")
-    return source, ast.parse(source, filename=file_path)
+    parsed = (source, ast.parse(source, filename=file_path))
+    if _memo_held:
+        _parse_memo[file_path] = parsed
+    return parsed
 
 
 def is_fresh(file_path: str, conn: sqlite3.Connection) -> bool:
