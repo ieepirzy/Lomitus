@@ -789,10 +789,15 @@ def _resolve_qualified(
 
 
 def _lookup_kind(conn: sqlite3.Connection, file_path: str, name: str) -> str | None:
-    row = conn.execute(
+    """The kind of the named node; with several nodes of one name (a property
+    getter and setter, overloads) "external" if any of them is."""
+    rows = conn.execute(
         "SELECT kind FROM nodes WHERE file_path = ? AND name = ?", (file_path, name)
-    ).fetchone()
-    return row[0] if row else None
+    ).fetchall()
+    if not rows:
+        return None
+    kinds = {r[0] for r in rows}
+    return "external" if "external" in kinds else rows[0][0]
 
 
 def _parse(file_path: str) -> tuple[str, ast.Module]:
@@ -903,13 +908,18 @@ def index_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> N
     )
     files, prefixes = _module_bindings(tree, abs_path, project_root)
     external_qualified: set[str] = set()
+    # Files reached by a resolved qualified call are edges too: "import pkg;
+    # pkg.mod.fn()" depends on pkg/mod.py without importing it by name, and
+    # effect typing looks there, so dependency tracking must as well.
+    qualified_targets: set[str] = set()
     if files or prefixes:
         for stmt, _cls in _all_stmts(tree):
-            if not isinstance(stmt, _DEFS):
-                continue
             for dotted in _calls(stmt).dotted:
                 hit = _resolve_qualified(dotted, files, prefixes, roots, root)
-                if hit and _lookup_kind(conn, hit[0], hit[1]) == "external":
+                if not hit:
+                    continue
+                qualified_targets.add(hit[0])
+                if isinstance(stmt, _DEFS) and _lookup_kind(conn, hit[0], hit[1]) == "external":
                     external_qualified.add(dotted)
     kind_map = _classify_module(
         tree,
@@ -919,7 +929,12 @@ def index_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> N
     )
 
     nodes = _nodes(abs_path, source, tree, kind_map)
-    edges = [(abs_path, target) for target in sorted(file_imports(tree, abs_path, project_root))]
+    targets = file_imports(tree, abs_path, project_root)
+    for t in qualified_targets:
+        targets.add(t)
+        targets.update(_ancestor_inits(t, root))
+    targets.discard(abs_path)
+    edges = [(abs_path, target) for target in sorted(targets)]
 
     with conn:
         conn.execute("DELETE FROM nodes WHERE file_path = ?", (abs_path,))

@@ -165,5 +165,36 @@ class TestStarImportAll(_Tmp):
         self.assertNotIn(str((self.root / "pkg/two.py").resolve()), got)
 
 
+class TestQualifiedCallEdges(_Tmp):
+    """Item 5: a qualified call resolved for effect typing is a dependency
+    edge too, so the incremental index re-checks it and selection follows it."""
+
+    def test_import_pkg_then_call_through_a_submodule(self):
+        _write(self.root, "pkg/__init__.py", "")
+        mod = _write(self.root, "pkg/mod.py", "import requests\ndef fn():\n    return requests.get('x')\n")
+        use = _write(self.root, "use.py", "import pkg\n\ndef go():\n    return pkg.mod.fn()\n")
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(dep_graph.SCHEMA)
+        dep_graph.index_file(mod, str(self.root), conn)
+        dep_graph.index_file(use, str(self.root), conn)
+        self.assertIn(mod, _edges(conn, use))
+        kind = conn.execute("SELECT kind FROM nodes WHERE file_path = ? AND name = 'go'", (use,)).fetchone()[0]
+        self.assertEqual(kind, "external")
+
+
+class TestDuplicateNamesInEffectLookup(_Tmp):
+    """Low: with a getter and a setter of one name, the lookup used whichever
+    row came first; external wins now."""
+
+    def test_external_setter_makes_the_name_external(self):
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(dep_graph.SCHEMA)
+        rows = [("/m.py::C.x", "structural"), ("/m.py::C.x#2", "external")]
+        for nid, kind in rows:  # getter first, as index_file inserts them
+            conn.execute("INSERT INTO nodes (node_id, file_path, name, kind, line_start, line_end, content_hash)"
+                         " VALUES (?, '/m.py', 'C.x', ?, 1, 1, 'h')", (nid, kind))
+        self.assertEqual(dep_graph._lookup_kind(conn, "/m.py", "C.x"), "external")
+
+
 if __name__ == "__main__":
     unittest.main()
