@@ -99,6 +99,34 @@ Manual-only flags:
 | `--worktree-status` | Report live status of all registered worktrees (JSON stdout) |
 | `--worktree-log` | Query worktree event log (JSON stdout) |
 
+## Library API: dependency graph for CI
+
+`lomitus.impact` exposes the same graph without the hook coordinator, for
+test-impact selection and result caching:
+
+```python
+from lomitus import impact
+
+graph = impact.index_project(".")                          # in-memory SQLite
+changes = impact.changed_files(".", "origin/main", "HEAD")  # pygit2, renames detected
+affected = impact.reverse_closure(graph, impact.to_absolute([c.path for c in changes], "."))
+nodes = impact.changed_nodes(".", "origin/main", "HEAD")    # which functions changed
+effects = impact.node_effects(graph)                        # (file, qualname) -> external/structural/benign
+key = impact.closure_hash(graph, "tests/test_api.py", ".")  # cache key for a test file's result
+```
+
+- `changed_nodes` and `closure_hash` hash the normalized AST by default
+  (`hash_mode="ast"`), so formatting- and comment-only edits change nothing.
+  The coordinator keeps hashing source text (`"source"`), since an agent reasons
+  over text.
+- Absolute imports resolve against import roots: `LOMITUS_IMPORT_ROOTS`
+  (os.pathsep-separated) or `[tool.lomitus] import_roots` in `pyproject.toml`;
+  otherwise detected (`src/`, setuptools/hatch/poetry package dirs, then the
+  project root).
+- The API answers graph questions only. Which changes force a full run (conftest,
+  migrations, lockfiles, CI config, non-Python inputs), which tests always run,
+  and a full run on the main branch as a safety net belong to the consumer.
+
 ## Watchdog
 
 Start the watchdog alongside a session for TTL-based lock revert on agent crashes:

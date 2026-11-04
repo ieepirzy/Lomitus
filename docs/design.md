@@ -413,6 +413,31 @@ The integration combines runtime coordination, AST-based rollback, a live depend
 
 ---
 
+## Library API for CI consumers
+
+`lomitus/impact.py` reuses the graph outside the coordinator: `index_project`,
+`changed_files` / `changed_nodes` between two revisions (read from git objects,
+no checkout), `reverse_closure` / `forward_closure` (unbounded), `node_effects`,
+and `closure_hash`.
+
+**Hash mode per consumer.** `dep_graph._hash` has two modes, chosen explicitly:
+
+| Consumer | Mode | Why |
+|---|---|---|
+| Coordinator (drift, worktree merge checks, `is_fresh`) | `source` | Agents reason over source text: a changed comment or reformat inside a locked node is still a change to what the holder read. Unchanged from before. |
+| `impact.changed_nodes`, `impact.file_digest`, `impact.closure_hash` | `ast` | A test result cannot depend on formatting or comments. `ast.dump(..., include_attributes=False)` drops positions, so moving or reformatting code is not a change. Docstrings are part of the AST and still count. |
+
+**Closure hash.** A Merkle root over the file and its whole forward import
+closure: leaves are `(project-relative path, file digest)`, sorted, so the key
+is the same on any checkout. Equal keys mean no Python code the file can
+import changed. Non-Python inputs (fixtures, SQL, templates), the interpreter
+and dependency versions are not covered; pass their digests via `extra`.
+
+**Effect typing in a batch.** Cross-file effects advance one hop per index pass.
+`index_project` re-indexes until no node's kind changes (at most
+`effect_passes`, default 3), so a chain `a -> b -> net` settles regardless of
+file order.
+
 ## Current limitations and roadmap
 
 ### External-effect classification (partially implemented)
@@ -422,6 +447,22 @@ The integration combines runtime coordination, AST-based rollback, a live depend
 The remaining blind spots include dynamic dispatch (calls through instances, `getattr`, registries keyed by string), decorators and wrappers that replace a function, external-module imports bound inside a function (`import_aliases` reads module-level imports), and effects outside the prefix set. A function-local project binding is treated as file-wide, an over-approximation. Cross-file classification is one hop per index pass and depends on indexing order (`update_file` re-indexes direct dependents).
 
 **Suggested fix:** implement effect typing — classify nodes as `pure | io | network | db | ...` and propagate the classification transitively through the call graph. A pure function calling an io function is io. The coordinator already has the call graph; effect propagation is a DFS over it.
+
+### Dependency graph for test selection (implemented, file-level)
+
+The graph is file-level: a test is selected when it imports a changed file,
+directly or transitively. Function-level narrowing (select only the tests that
+call a changed function) is possible through `changed_nodes` and the resolved
+calls, but on the project it was measured against nearly every change also
+touched module-level code, so narrowing saved little. Calls the resolver
+cannot see (dynamic dispatch, string-keyed registries, tests reaching code over
+HTTP or a subprocess) are why a consumer needs full-run triggers and a full run
+on main.
+
+`from pkg import submodule` keeps an edge to `pkg/__init__.py` as well as the
+submodule: Python runs the package `__init__` on that import. `ruff analyze
+graph` records only the submodule, so Lomitus's edge set is a superset of ruff's
+on the same project.
 
 ### Snapshot execution isolation (implemented with limitations)
 
