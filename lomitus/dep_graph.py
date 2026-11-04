@@ -560,8 +560,26 @@ def _resolve_from(
     return mod_file, sub
 
 
+_all_memo: dict[tuple[str, int, int], list[str]] = {}
+
+
 def _literal_all(module_file: str) -> list[str]:
-    """The names in a module's literal __all__ list or tuple, else []."""
+    """The names in a module's literal __all__ list or tuple, else [].
+    Memoized per (path, mtime, size): every "from pkg import *" importer
+    would otherwise re-read and re-parse the same __init__.py."""
+    try:
+        st = Path(module_file).stat()
+    except OSError:
+        return []
+    key = (module_file, st.st_mtime_ns, st.st_size)
+    if key not in _all_memo:
+        if len(_all_memo) > 4096:
+            _all_memo.clear()
+        _all_memo[key] = _literal_all_uncached(module_file)
+    return _all_memo[key]
+
+
+def _literal_all_uncached(module_file: str) -> list[str]:
     try:
         tree = ast.parse(Path(module_file).read_text(encoding="utf-8"))
     except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
@@ -800,9 +818,20 @@ def _lookup_kind(conn: sqlite3.Connection, file_path: str, name: str) -> str | N
     return "external" if "external" in kinds else rows[0][0]
 
 
+_parse_memo: dict[str, tuple[str, ast.Module]] = {}
+
+
 def _parse(file_path: str) -> tuple[str, ast.Module]:
+    # Inside a batch (index_files / lomitus.impact.index_project, which hold
+    # the memo) files don't change, so later effect-typing passes reuse the
+    # parse. Outside one, always read the file fresh.
+    if _memo_held and file_path in _parse_memo:
+        return _parse_memo[file_path]
     source = Path(file_path).read_text(encoding="utf-8")
-    return source, ast.parse(source, filename=file_path)
+    parsed = (source, ast.parse(source, filename=file_path))
+    if _memo_held:
+        _parse_memo[file_path] = parsed
+    return parsed
 
 
 def is_fresh(file_path: str, conn: sqlite3.Connection) -> bool:
