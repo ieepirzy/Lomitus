@@ -430,7 +430,8 @@ renamed-away files, from the base revision's graph built from its git objects),
 | `impact.changed_nodes`, `impact.file_digest`, `impact.closure_hash` | `ast` | A test result cannot depend on formatting or comments. `ast.dump(..., include_attributes=False)` drops positions, so moving or reformatting code is not a change. Docstrings are part of the AST and still count. |
 
 **Closure hash.** A Merkle root over the test file, the `conftest.py` files
-pytest loads for it (its directory up to the project root), the modules their
+pytest loads for it (its directory up to the project root, or up to
+`conftest_root` for a subdirectory project whose pytest rootdir is higher), the modules their
 literal `pytest_plugins` name, and the forward import closure of all of these.
 Leaves are `(project-relative path, file digest)`, sorted, so the key is the same
 on any checkout; a file digest follows source order, so moving a top-level

@@ -179,5 +179,74 @@ class TestExcludes(_Repo):
         self.assertNotIn("build/lib/app/core.py", files)
 
 
+class TestNonPythonDeletesAndRenames(_Repo):
+    """Re-review B: affected_files passed every deleted or renamed path to
+    importers_at, which only materializes .py files, so deleting data.json
+    raised ValueError."""
+
+    def test_deleting_data_and_renaming_text_do_not_crash(self):
+        self.write("src/app/data.json", "{}\n")
+        self.write("docs/old.txt", "x\n")
+        self.write("src/app/gone.py", "X = 1\n")
+        self.write("tests/test_gone.py", "from app.gone import X\n")
+        base = self.commit("add data")
+        (self.root / "src/app/data.json").unlink()
+        self.git("mv", "docs/old.txt", "docs/new.txt")
+        (self.root / "src/app/gone.py").unlink()
+        head = self.commit("delete data, rename text, delete gone")
+        affected = impact.affected_files(self.root, base, head)
+        self.assertIn("tests/test_gone.py", affected)  # .py deletes still resolved
+        self.assertEqual(impact.importers_at(self.root, base, ["src/app/data.json"]), set())
+
+    def test_non_python_deletes_alone_build_no_base_graph(self):
+        self.write("src/app/data.json", "{}\n")
+        base = self.commit("add data")
+        (self.root / "src/app/data.json").unlink()
+        head = self.commit("delete data")
+        from unittest import mock
+        with mock.patch.object(impact, "importers_at", wraps=impact.importers_at) as spy:
+            impact.affected_files(self.root, base, head)
+        spy.assert_not_called()
+
+
+class TestConftestAboveASubdirectoryProject(unittest.TestCase):
+    """Re-review D: a conftest.py above a subdirectory project's root is
+    covered when conftest_root names the pytest rootdir."""
+
+    def test_conftest_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d).resolve()
+            proj = repo / "svc"
+            (proj / "src/app").mkdir(parents=True)
+            (proj / "tests").mkdir()
+            (proj / "src/app/__init__.py").write_text("")
+            (proj / "tests/test_x.py").write_text("def test_x():\n    pass\n")
+            (repo / "conftest.py").write_text("A = 1\n")
+            dep_graph._roots_for.cache_clear()
+            conn = impact.index_project(proj)
+            test = str(proj / "tests/test_x.py")
+            h_default = impact.closure_hash(conn, test, proj)
+            h_root = impact.closure_hash(conn, test, proj, conftest_root=repo)
+            (repo / "conftest.py").write_text("A = 2\n")
+            self.assertEqual(impact.closure_hash(conn, test, proj), h_default)  # documented: not covered
+            self.assertNotEqual(impact.closure_hash(conn, test, proj, conftest_root=repo), h_root)
+
+
+class TestLiteralAllMemo(unittest.TestCase):
+    def test_parsed_once_per_version_of_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            init = Path(d) / "__init__.py"
+            init.write_text('__all__ = ["a"]\n')
+            f = str(init)
+            real = dep_graph.ast.parse
+            from unittest import mock
+            with mock.patch.object(dep_graph.ast, "parse", side_effect=real) as parse:
+                self.assertEqual(dep_graph._literal_all(f), ["a"])
+                self.assertEqual(dep_graph._literal_all(f), ["a"])
+                self.assertEqual(parse.call_count, 1)
+                init.write_text('__all__ = ["a", "bb"]\n')
+                self.assertEqual(dep_graph._literal_all(f), ["a", "bb"])
+
+
 if __name__ == "__main__":
     unittest.main()

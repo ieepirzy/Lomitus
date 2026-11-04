@@ -120,7 +120,9 @@ key = impact.closure_hash(graph, "tests/test_api.py", ".", extra=[lockfile_diges
   files' old paths on the base revision's graph** (`importers_at`): a test that
   still imports a module the change deleted or moved is selected. If you build
   selection from `reverse_closure` on the head graph yourself, treat deleted and
-  renamed `.py` files as mandatory full-run triggers.
+  renamed `.py` files as mandatory full-run triggers. Deleted or renamed
+  non-Python files (data, templates, config) have no importers on the graph:
+  they are always the consumer's full-run trigger.
 - `changed_nodes` reports file-level `deleted`, `renamed` and `unparseable`
   entries (label `<file>`) and a `reordered` entry (label `<order>`) when
   top-level statements moved: import-time order matters.
@@ -134,7 +136,9 @@ key = impact.closure_hash(graph, "tests/test_api.py", ".", extra=[lockfile_diges
   default, because `ast.dump` output differs between Python versions, so a key is
   only comparable within one version. Data files, fixtures, the lockfile, plugins
   enabled outside the project and the environment are not covered: pass their
-  digests in `extra`.
+  digests in `extra`. Conftests are collected up to the project root; for a
+  project in a subdirectory whose pytest rootdir is higher up, pass
+  `conftest_root=` (e.g. the repository root) so those count too.
 - Paths: `changed_files`, `changed_nodes`, `affected_files` and `importers_at`
   speak project-relative POSIX paths; the graph functions speak absolute paths.
   `to_absolute` raises on a path that doesn't exist under the project root

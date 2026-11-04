@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import os
 import sqlite3
 import sys
 import tempfile
@@ -381,7 +382,12 @@ def importers_at(
     directly or transitively, on the graph as it was at `rev`: built from
     the revision's git objects in a temporary directory. For deleted files
     and renamed files' old paths, whose importers the head graph can't see.
+    Only .py paths can have importers; others are ignored (a deleted data
+    file or template is the consumer's full-run trigger).
     """
+    paths = [p for p in paths if p.endswith(".py")]
+    if not paths:
+        return set()
     pygit2, repo = _repo(repo_path)
     prefix = _project_prefix(repo, project_root if project_root is not None else repo_path)
     tree = _commit_tree(pygit2, repo, rev)
@@ -418,8 +424,12 @@ def affected_files(
         conn = index_project(root)
     present = [c.path for c in changes if c.status != "deleted"]
     out = to_relative(reverse_closure(conn, to_absolute(present, root, must_exist=False)), root)
-    gone = [c.path for c in changes if c.status == "deleted"] + [
-        c.old_path for c in changes if c.status == "renamed" and c.old_path
+    # Only Python modules have importers on the graph. A deleted or renamed
+    # non-.py file (data, templates, config) is the consumer's full-run
+    # trigger, as documented.
+    gone = [c.path for c in changes if c.status == "deleted" and c.path.endswith(".py")] + [
+        c.old_path for c in changes
+        if c.status == "renamed" and c.old_path and c.old_path.endswith(".py")
     ]
     if gone:
         out |= importers_at(repo_path, base, gone, project_root=root)
@@ -467,7 +477,7 @@ def file_digest(path: str | Path, hash_mode: dg.HashMode = "ast") -> str:
 
 def _conftests(file: Path, root: Path) -> list[Path]:
     """conftest.py files pytest loads for `file`: in its directory and every
-    ancestor up to the project root."""
+    ancestor up to `root` (closure_hash's conftest_root)."""
     out = []
     d = file.parent
     while d.is_relative_to(root):
@@ -510,6 +520,7 @@ def closure_hash(
     hash_mode: dg.HashMode = "ast",
     extra: Iterable[str] = (),
     include_python: bool = True,
+    conftest_root: str | Path | None = None,
 ) -> str:
     """
     A Merkle root over `file`, the conftest.py files pytest loads for it
@@ -525,19 +536,23 @@ def closure_hash(
     versions (the lockfile), plugins enabled outside the project (`-p` in
     pytest config, installed entry points) and the environment are NOT
     covered: pass their digests via `extra`.
+
+    Conftests are collected up to `conftest_root` (default: project_root).
+    For a project in a subdirectory whose pytest rootdir is higher up (e.g.
+    the repository root), pass that directory so conftest.py files above
+    the project count too; their leaves are paths relative to the project
+    root ("../conftest.py"), still stable across checkouts.
     """
     root = Path(project_root).resolve()
+    croot = Path(conftest_root).resolve() if conftest_root is not None else root
     start = [str(Path(file).resolve())]
-    for c in _conftests(Path(file).resolve(), root):
+    for c in _conftests(Path(file).resolve(), croot):
         start.append(str(c))
         start.extend(_pytest_plugins(c, root))
     leaves = []
     for f in sorted(forward_closure(conn, start)):
         p = Path(f)
-        try:
-            rel = p.relative_to(root).as_posix()
-        except ValueError:
-            rel = p.as_posix()
+        rel = Path(os.path.relpath(p, root)).as_posix()
         leaves.append(f"{rel}\0{file_digest(p, hash_mode)}")
     if include_python:
         leaves.append(f"python\0{sys.version_info.major}.{sys.version_info.minor}")

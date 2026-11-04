@@ -560,8 +560,26 @@ def _resolve_from(
     return mod_file, sub
 
 
+_all_memo: dict[tuple[str, int, int], list[str]] = {}
+
+
 def _literal_all(module_file: str) -> list[str]:
-    """The names in a module's literal __all__ list or tuple, else []."""
+    """The names in a module's literal __all__ list or tuple, else [].
+    Memoized per (path, mtime, size): every "from pkg import *" importer
+    would otherwise re-read and re-parse the same __init__.py."""
+    try:
+        st = Path(module_file).stat()
+    except OSError:
+        return []
+    key = (module_file, st.st_mtime_ns, st.st_size)
+    if key not in _all_memo:
+        if len(_all_memo) > 4096:
+            _all_memo.clear()
+        _all_memo[key] = _literal_all_uncached(module_file)
+    return _all_memo[key]
+
+
+def _literal_all_uncached(module_file: str) -> list[str]:
     try:
         tree = ast.parse(Path(module_file).read_text(encoding="utf-8"))
     except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
