@@ -196,5 +196,35 @@ class TestDuplicateNamesInEffectLookup(_Tmp):
         self.assertEqual(dep_graph._lookup_kind(conn, "/m.py", "C.x"), "external")
 
 
+class TestTargetingDoesNotParseUnlessAHeaderIsHit(_Tmp):
+    """Item 8: identify_target_nodes runs on every Edit hook; it parsed the
+    whole file each time to scope class-header matches."""
+
+    def test_parse_only_when_a_class_header_overlaps(self):
+        f = _write(self.root, "t.py", """
+            def top():
+                return 1
+
+            class K:
+                limit = 1
+
+                def a(self):
+                    return 2
+        """)
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(dep_graph.SCHEMA)
+        dep_graph.index_file(f, str(self.root), conn)
+        real = dep_graph.ast.parse
+        with mock.patch.object(dep_graph.ast, "parse", side_effect=real) as parse:
+            got = dep_graph.identify_target_nodes(f, "Edit", {"old_string": "return 1"}, conn)
+            self.assertEqual({g.split("::", 1)[1] for g in got}, {"top"})
+            self.assertEqual(parse.call_count, 0)
+            got = dep_graph.identify_target_nodes(f, "Edit", {"old_string": "return 2"}, conn)
+            self.assertEqual({g.split("::", 1)[1] for g in got}, {"K.a"})
+            self.assertEqual(parse.call_count, 1)
+            got = dep_graph.identify_target_nodes(f, "Edit", {"old_string": "limit = 1"}, conn)
+            self.assertEqual({g.split("::", 1)[1] for g in got}, {"K"})
+
+
 if __name__ == "__main__":
     unittest.main()

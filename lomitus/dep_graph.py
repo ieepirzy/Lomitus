@@ -1131,32 +1131,14 @@ def identify_target_nodes(
         return []
 
     rows = conn.execute(
-        "SELECT node_id, line_start, line_end FROM nodes WHERE file_path = ? ORDER BY line_start",
+        "SELECT node_id, line_start, line_end, name, kind FROM nodes WHERE file_path = ? ORDER BY line_start",
         (abs_path,),
     ).fetchall()
     if not rows:
         return []
 
-    # A class header node spans the whole class, but only its own lines
-    # (decorators, the class statement, non-method members) target it: an
-    # edit inside a method, or between methods, is not a header edit.
-    header_lines: dict[str, set[int]] = {}
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        tree = None
-    if tree is not None:
-        for stmt in tree.body:
-            if not isinstance(stmt, ast.ClassDef):
-                continue
-            first_body = stmt.body[0].lineno if stmt.body else (stmt.end_lineno or stmt.lineno) + 1
-            lines = set(range(_first_line(stmt), max(stmt.lineno, first_body - 1) + 1))
-            for m in stmt.body:
-                if not isinstance(m, _DEFS):
-                    lines.update(range(_first_line(m), (m.end_lineno or m.lineno) + 1))
-            header_lines[_node_id(abs_path, stmt.name)] = lines
-
-    matched: set[str] = set()
+    # node_id -> the edit line ranges that overlap it
+    hits: dict[str, list[tuple[int, int]]] = {}
     for old_string in old_strings:
         # Find ALL occurrences to handle non-unique old_strings correctly; for MultiEdit,
         # later edits may not exist in current source yet (created by an earlier edit in
@@ -1168,14 +1150,40 @@ def identify_target_nodes(
                 break
             edit_line_start = source[:offset].count("\n") + 1
             edit_line_end   = edit_line_start + old_string.count("\n")
-            for node_id, line_start, line_end in rows:
+            for node_id, line_start, line_end, _name, _kind in rows:
                 if line_start <= edit_line_end and line_end >= edit_line_start:
-                    own = header_lines.get(node_id)
-                    if own is not None and not own.intersection(range(edit_line_start, edit_line_end + 1)):
-                        continue
-                    matched.add(node_id)
+                    hits.setdefault(node_id, []).append((edit_line_start, edit_line_end))
             search_start = offset + 1
 
+    # A class header node spans the whole class, but only its own lines
+    # (decorators, the class statement, non-method members) target it: an
+    # edit inside a method, or between methods, is not a header edit. Only a
+    # class header is a named "benign" node (functions are structural or
+    # external), and the file is parsed only when one was hit: the hook runs
+    # on every Edit.
+    headers = {nid for nid, _s, _e, name, kind in rows if name and kind == "benign" and nid in hits}
+    if headers:
+        header_lines: dict[str, set[int]] = {}
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            for stmt in tree.body:
+                if not isinstance(stmt, ast.ClassDef):
+                    continue
+                first_body = stmt.body[0].lineno if stmt.body else (stmt.end_lineno or stmt.lineno) + 1
+                lines = set(range(_first_line(stmt), max(stmt.lineno, first_body - 1) + 1))
+                for m in stmt.body:
+                    if not isinstance(m, _DEFS):
+                        lines.update(range(_first_line(m), (m.end_lineno or m.lineno) + 1))
+                header_lines[_node_id(abs_path, stmt.name)] = lines
+        for nid in headers:
+            own = header_lines.get(nid)
+            if own is not None and not any(own.intersection(range(a, b + 1)) for a, b in hits[nid]):
+                del hits[nid]
+
+    matched = set(hits)
     return list(matched)
 
 
