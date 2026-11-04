@@ -237,6 +237,31 @@ def get_db() -> sqlite3.Connection:
 GRAPH_FORMAT = 2
 
 
+def _migrate_graph_format(conn: sqlite3.Connection) -> bool:
+    """Drop the cached graph and record GRAPH_FORMAT, atomically and only
+    when no lock is held. True if it migrated."""
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        held = conn.execute("SELECT COUNT(*) FROM locks").fetchone()[0]
+        if version >= GRAPH_FORMAT or held:
+            conn.execute("ROLLBACK")
+            return False
+        conn.execute("DELETE FROM nodes")
+        conn.execute("DELETE FROM edges")
+        conn.execute("DELETE FROM agent_traversal_nodes")
+        conn.execute("DELETE FROM agent_traversal_edges")
+        conn.execute(f"PRAGMA user_version = {GRAPH_FORMAT}")
+        conn.execute("COMMIT")
+        return True
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     # v0 → v1: locks PK changed from file_path to node_id — drop and recreate.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(locks)").fetchall()}
@@ -294,15 +319,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # Graph format, tracked in PRAGMA user_version. Format 2 (node ids are
     # labels: "C.x#2", "var:LIMIT", class header nodes; edges from imports at
     # any depth): drop the cached graph so every file re-indexes on its next
-    # touch instead of mixing old line-number ids with new labels. Locks that
-    # still name old-format ids expire by their TTL as before.
+    # touch instead of mixing old line-number ids with new labels.
+    #
+    # Only while no lock is held: a held lock's release-time drift check
+    # reads the nodes it captured, and a node that vanished reads as drift,
+    # which rolls the agent's edit back. With locks held the drop waits for
+    # a later open. The check, the drop and the version bump are one
+    # IMMEDIATE transaction, so a second hook process that read the old
+    # version can't drop a graph the first one already rebuilt.
     if conn.execute("PRAGMA user_version").fetchone()[0] < GRAPH_FORMAT:
-        with conn:
-            conn.execute("DELETE FROM nodes")
-            conn.execute("DELETE FROM edges")
-            conn.execute("DELETE FROM agent_traversal_nodes")
-            conn.execute("DELETE FROM agent_traversal_edges")
-        conn.execute(f"PRAGMA user_version = {GRAPH_FORMAT}")
+        _migrate_graph_format(conn)
 
 
 # ---------------------------------------------------------------------------

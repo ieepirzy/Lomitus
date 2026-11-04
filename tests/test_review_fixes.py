@@ -85,6 +85,29 @@ class TestWorktreeStaleCheck(_Tmp):
 class TestGraphFormatMigration(unittest.TestCase):
     """Item 9: a DB indexed with line-number node ids is dropped on open."""
 
+    def test_migration_waits_while_a_lock_is_held(self):
+        """Re-review A: dropping the graph under a held lock made the lock's
+        release-time drift check read every captured node as gone, which
+        rolled the agent's edit back."""
+        with tempfile.TemporaryDirectory() as d:
+            path = str(Path(d) / "c.db")
+            conn = sqlite3.connect(path)
+            co._migrate(conn)
+            conn.execute("PRAGMA user_version = 1")  # a DB from before format 2
+            conn.execute("INSERT INTO nodes (node_id, file_path, name, kind, line_start, line_end, content_hash)"
+                         " VALUES ('/a.py::f', '/a.py', 'f', 'structural', 1, 2, 'h')")
+            conn.execute("INSERT INTO locks (node_id, file_path, agent_id, acquired_at) VALUES ('/a.py::f', '/a.py', 'a1', 'now')")
+            conn.commit()
+            co._migrate(conn)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 1)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            conn.execute("DELETE FROM locks")
+            conn.commit()
+            co._migrate(conn)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 0)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], co.GRAPH_FORMAT)
+            conn.close()
+
     def test_old_graph_is_dropped_once(self):
         with tempfile.TemporaryDirectory() as d:
             path = str(Path(d) / "c.db")
