@@ -550,7 +550,29 @@ def _resolve_from(
             f = _resolve_module(f"{module}.{a.name}", roots, root)
             if f:
                 sub[a.asname or a.name] = f
+    if mod_file and mod_file.endswith("__init__.py") and any(a.name == "*" for a in stmt.names):
+        # "from pkg import *" imports the submodules a literal __all__ names.
+        pkg_dir = Path(mod_file).parent
+        for name in _literal_all(mod_file):
+            f = _module_file(pkg_dir / name, root)
+            if f:
+                sub.setdefault(name, f)
     return mod_file, sub
+
+
+def _literal_all(module_file: str) -> list[str]:
+    """The names in a module's literal __all__ list or tuple, else []."""
+    try:
+        tree = ast.parse(Path(module_file).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+        return []
+    for stmt in tree.body:
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target] if isinstance(stmt, ast.AnnAssign) else []
+        if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets) and isinstance(
+            getattr(stmt, "value", None), (ast.List, ast.Tuple)
+        ):
+            return [e.value for e in stmt.value.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    return []
 
 
 def _string_imports(tree: ast.AST) -> list[str]:
@@ -586,7 +608,29 @@ def resolve_import(
             if resolved and resolved not in results:
                 results.append(resolved)
 
+    for f in list(results):
+        for init in _ancestor_inits(f, root):
+            if init not in results:
+                results.append(init)
     return [r for r in results if r != str(origin)]
+
+
+def _ancestor_inits(module_file: str, project_root: Path) -> list[str]:
+    """Every package __init__.py Python runs before module_file on import:
+    "import a.b.c" runs a/__init__.py and a/b/__init__.py first. Walks up
+    while the directory is a package, inside the project."""
+    p = Path(module_file)
+    d = p.parent.parent if p.name == "__init__.py" else p.parent
+    out: list[str] = []
+    while d.is_relative_to(project_root) and d != project_root.parent:
+        init = d / "__init__.py"
+        if not init.is_file():
+            break
+        out.append(str(init))
+        if d == project_root:
+            break
+        d = d.parent
+    return out
 
 
 _imports_cache: dict[int, tuple[ast.AST, list, list[str]]] = {}
@@ -637,6 +681,7 @@ def file_imports(tree: ast.AST, from_file: str, project_root: str) -> set[str]:
         f = _resolve_module(name, roots, root)
         if f:
             targets.add(f)
+            targets.update(_ancestor_inits(f, root))
     targets.discard(origin)
     return targets
 
@@ -744,10 +789,15 @@ def _resolve_qualified(
 
 
 def _lookup_kind(conn: sqlite3.Connection, file_path: str, name: str) -> str | None:
-    row = conn.execute(
+    """The kind of the named node; with several nodes of one name (a property
+    getter and setter, overloads) "external" if any of them is."""
+    rows = conn.execute(
         "SELECT kind FROM nodes WHERE file_path = ? AND name = ?", (file_path, name)
-    ).fetchone()
-    return row[0] if row else None
+    ).fetchall()
+    if not rows:
+        return None
+    kinds = {r[0] for r in rows}
+    return "external" if "external" in kinds else rows[0][0]
 
 
 _parse_memo: dict[str, tuple[str, ast.Module]] = {}
@@ -869,13 +919,18 @@ def index_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> N
     )
     files, prefixes = _module_bindings(tree, abs_path, project_root)
     external_qualified: set[str] = set()
+    # Files reached by a resolved qualified call are edges too: "import pkg;
+    # pkg.mod.fn()" depends on pkg/mod.py without importing it by name, and
+    # effect typing looks there, so dependency tracking must as well.
+    qualified_targets: set[str] = set()
     if files or prefixes:
         for stmt, _cls in _all_stmts(tree):
-            if not isinstance(stmt, _DEFS):
-                continue
             for dotted in _calls(stmt).dotted:
                 hit = _resolve_qualified(dotted, files, prefixes, roots, root)
-                if hit and _lookup_kind(conn, hit[0], hit[1]) == "external":
+                if not hit:
+                    continue
+                qualified_targets.add(hit[0])
+                if isinstance(stmt, _DEFS) and _lookup_kind(conn, hit[0], hit[1]) == "external":
                     external_qualified.add(dotted)
     kind_map = _classify_module(
         tree,
@@ -885,7 +940,12 @@ def index_file(file_path: str, project_root: str, conn: sqlite3.Connection) -> N
     )
 
     nodes = _nodes(abs_path, source, tree, kind_map)
-    edges = [(abs_path, target) for target in sorted(file_imports(tree, abs_path, project_root))]
+    targets = file_imports(tree, abs_path, project_root)
+    for t in qualified_targets:
+        targets.add(t)
+        targets.update(_ancestor_inits(t, root))
+    targets.discard(abs_path)
+    edges = [(abs_path, target) for target in sorted(targets)]
 
     with conn:
         conn.execute("DELETE FROM nodes WHERE file_path = ?", (abs_path,))
@@ -1082,32 +1142,14 @@ def identify_target_nodes(
         return []
 
     rows = conn.execute(
-        "SELECT node_id, line_start, line_end FROM nodes WHERE file_path = ? ORDER BY line_start",
+        "SELECT node_id, line_start, line_end, name, kind FROM nodes WHERE file_path = ? ORDER BY line_start",
         (abs_path,),
     ).fetchall()
     if not rows:
         return []
 
-    # A class header node spans the whole class, but only its own lines
-    # (decorators, the class statement, non-method members) target it: an
-    # edit inside a method, or between methods, is not a header edit.
-    header_lines: dict[str, set[int]] = {}
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        tree = None
-    if tree is not None:
-        for stmt in tree.body:
-            if not isinstance(stmt, ast.ClassDef):
-                continue
-            first_body = stmt.body[0].lineno if stmt.body else (stmt.end_lineno or stmt.lineno) + 1
-            lines = set(range(_first_line(stmt), max(stmt.lineno, first_body - 1) + 1))
-            for m in stmt.body:
-                if not isinstance(m, _DEFS):
-                    lines.update(range(_first_line(m), (m.end_lineno or m.lineno) + 1))
-            header_lines[_node_id(abs_path, stmt.name)] = lines
-
-    matched: set[str] = set()
+    # node_id -> the edit line ranges that overlap it
+    hits: dict[str, list[tuple[int, int]]] = {}
     for old_string in old_strings:
         # Find ALL occurrences to handle non-unique old_strings correctly; for MultiEdit,
         # later edits may not exist in current source yet (created by an earlier edit in
@@ -1119,14 +1161,40 @@ def identify_target_nodes(
                 break
             edit_line_start = source[:offset].count("\n") + 1
             edit_line_end   = edit_line_start + old_string.count("\n")
-            for node_id, line_start, line_end in rows:
+            for node_id, line_start, line_end, _name, _kind in rows:
                 if line_start <= edit_line_end and line_end >= edit_line_start:
-                    own = header_lines.get(node_id)
-                    if own is not None and not own.intersection(range(edit_line_start, edit_line_end + 1)):
-                        continue
-                    matched.add(node_id)
+                    hits.setdefault(node_id, []).append((edit_line_start, edit_line_end))
             search_start = offset + 1
 
+    # A class header node spans the whole class, but only its own lines
+    # (decorators, the class statement, non-method members) target it: an
+    # edit inside a method, or between methods, is not a header edit. Only a
+    # class header is a named "benign" node (functions are structural or
+    # external), and the file is parsed only when one was hit: the hook runs
+    # on every Edit.
+    headers = {nid for nid, _s, _e, name, kind in rows if name and kind == "benign" and nid in hits}
+    if headers:
+        header_lines: dict[str, set[int]] = {}
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            for stmt in tree.body:
+                if not isinstance(stmt, ast.ClassDef):
+                    continue
+                first_body = stmt.body[0].lineno if stmt.body else (stmt.end_lineno or stmt.lineno) + 1
+                lines = set(range(_first_line(stmt), max(stmt.lineno, first_body - 1) + 1))
+                for m in stmt.body:
+                    if not isinstance(m, _DEFS):
+                        lines.update(range(_first_line(m), (m.end_lineno or m.lineno) + 1))
+                header_lines[_node_id(abs_path, stmt.name)] = lines
+        for nid in headers:
+            own = header_lines.get(nid)
+            if own is not None and not any(own.intersection(range(a, b + 1)) for a, b in hits[nid]):
+                del hits[nid]
+
+    matched = set(hits)
     return list(matched)
 
 
