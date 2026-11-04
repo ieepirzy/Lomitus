@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -208,14 +209,20 @@ CREATE INDEX IF NOT EXISTS idx_intents_node    ON agent_intents(node_id);
 # ---------------------------------------------------------------------------
 
 def get_db() -> sqlite3.Connection:
-    # Anchor DB to the main repo root so all per-worktree hook processes share one DB.
-    try:
-        cwd = str(Path.cwd())
-        project_root = find_project_root(cwd)
-        main_root = _main_repo_root(project_root)
-    except Exception:
-        main_root = str(Path.cwd())
-    db_path = Path(main_root) / ".claude" / "coordinator.db"
+    # LOMITUS_DB overrides the location (tests use it so a suite run from a
+    # linked worktree never writes into the main checkout's live DB).
+    override = os.environ.get("LOMITUS_DB")
+    if override:
+        db_path = Path(override)
+    else:
+        # Anchor DB to the main repo root so all per-worktree hook processes share one DB.
+        try:
+            cwd = str(Path.cwd())
+            project_root = find_project_root(cwd)
+            main_root = _main_repo_root(project_root)
+        except Exception:
+            main_root = str(Path.cwd())
+        db_path = Path(main_root) / ".claude" / "coordinator.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")

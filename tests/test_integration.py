@@ -17,7 +17,11 @@ import unittest
 from pathlib import Path
 
 ROOT    = Path(__file__).parent.parent.resolve()
-DB_PATH = ROOT / ".claude" / "coordinator.db"
+# A private DB per test run (LOMITUS_DB): the coordinator would otherwise
+# anchor to the main checkout's live .claude/coordinator.db, also from a
+# linked worktree, and _reset below deletes the file it points at.
+_DB_DIR = Path(tempfile.mkdtemp(prefix="lomitus-it-"))
+DB_PATH = _DB_DIR / "coordinator.db"
 
 CALC     = str(ROOT / "tests" / "fixtures" / "calc.py")
 MODELS   = str(ROOT / "tests" / "fixtures" / "models.py")
@@ -37,7 +41,7 @@ def _run(payload: dict, *flags: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         cwd=str(ROOT),
-        env={**__import__("os").environ, "PYTHONPATH": str(ROOT / "src")},
+        env={**__import__("os").environ, "PYTHONPATH": str(ROOT / "src"), "LOMITUS_DB": str(DB_PATH)},
     )
 
 

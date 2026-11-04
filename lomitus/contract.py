@@ -242,21 +242,19 @@ def mock_type_from_db(annotation_name: str, conn: sqlite3.Connection | None) -> 
     return a marker telling the snapshot subprocess to construct a lightweight mock
     in its place instead of falling back to None.
 
-    dep_graph._all_stmts only indexes a class's *methods* — the ClassDef statement
-    itself is intentionally not stored as a node (see its docstring: storing the
-    whole class body would cause false-positive drift whenever any sibling method
-    changes). A class's presence is therefore inferred from any indexed method whose
-    qualified `name` is "ClassName.method", which is exactly the shape dep_graph._name
-    produces for class members. A class with no methods at all (e.g. a bare-field
-    dataclass with no explicit methods) has no indexed node and cannot be detected
-    this way — narrower than the design doc's "query for a ClassDef" sketch, but
-    that matches what dep_graph actually persists.
+    dep_graph indexes each class as a *header* node named "ClassName" (its
+    decorators, bases and non-method members; methods excluded so a method edit
+    is never drift of the class), so a bare-field dataclass is found too. DBs
+    indexed by older versions only have the methods ("ClassName.method"), which
+    the LIKE branch still matches.
     """
     if conn is None:
         return None
+    # The class's own header node (name == ClassName) since dep_graph indexes
+    # one, or any method of it for DBs indexed before that.
     row = conn.execute(
-        "SELECT node_id FROM nodes WHERE name LIKE ? LIMIT 1",
-        (f"{annotation_name}.%",),
+        "SELECT node_id FROM nodes WHERE name = ? OR name LIKE ? LIMIT 1",
+        (annotation_name, f"{annotation_name}.%"),
     ).fetchone()
     if row is None:
         return None
