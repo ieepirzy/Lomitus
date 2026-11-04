@@ -105,5 +105,65 @@ class TestGraphFormatMigration(unittest.TestCase):
             conn.close()
 
 
+def _edges(conn: sqlite3.Connection, from_file: str) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT to_file FROM edges WHERE from_file = ?", (from_file,))}
+
+
+class TestAncestorPackageInits(_Tmp):
+    """Item 2: importing pkg.sub.deep runs pkg/__init__.py and
+    pkg/sub/__init__.py first, so a change there affects the importer."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.pkg_init = _write(self.root, "pkg/__init__.py", "CONFIG = {}\n")
+        self.sub_init = _write(self.root, "pkg/sub/__init__.py", "")
+        _write(self.root, "pkg/mod.py", "def f():\n    return 1\n")
+        _write(self.root, "pkg/sub/deep.py", "def g():\n    return 2\n")
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(dep_graph.SCHEMA)
+
+    def _index(self, rel: str, body: str) -> str:
+        f = _write(self.root, rel, body)
+        dep_graph.index_file(f, str(self.root), self.conn)
+        return f
+
+    def test_plain_import_of_a_submodule(self):
+        a = self._index("a.py", "import pkg.mod\n")
+        self.assertIn(self.pkg_init, _edges(self.conn, a))
+
+    def test_from_deep_module_import_name(self):
+        b = self._index("b.py", "from pkg.sub.deep import g\n")
+        self.assertTrue({self.pkg_init, self.sub_init} <= _edges(self.conn, b), _edges(self.conn, b))
+
+    def test_relative_import_of_a_deep_module(self):
+        r = self._index("pkg/rel.py", "from .sub.deep import g\n")
+        self.assertIn(self.sub_init, _edges(self.conn, r))
+
+    def test_string_import(self):
+        c = self._index("c.py", "import importlib\nimportlib.import_module('pkg.sub.deep')\n")
+        self.assertTrue({self.pkg_init, self.sub_init} <= _edges(self.conn, c))
+
+    def test_reverse_crawl_from_a_package_init_reaches_importers_of_its_submodules(self):
+        a = self._index("a.py", "import pkg.mod\n")
+        b = self._index("b.py", "from pkg.sub.deep import g\n")
+        got = dep_graph.crawl_subgraph(self.sub_init, depth=5, conn=self.conn, direction="reverse")
+        self.assertIn(b, got)
+        self.assertNotIn(a, got)  # pkg.mod does not run pkg/sub/__init__.py
+
+
+class TestStarImportAll(_Tmp):
+    def test_star_import_edges_to_the_submodules_all_names(self):
+        _write(self.root, "pkg/__init__.py", '__all__ = ["one", "helper"]\nhelper = 1\n')
+        one = _write(self.root, "pkg/one.py", "X = 1\n")
+        _write(self.root, "pkg/two.py", "Y = 2\n")
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(dep_graph.SCHEMA)
+        s = _write(self.root, "s.py", "from pkg import *\n")
+        dep_graph.index_file(s, str(self.root), conn)
+        got = _edges(conn, s)
+        self.assertIn(one, got)
+        self.assertNotIn(str((self.root / "pkg/two.py").resolve()), got)
+
+
 if __name__ == "__main__":
     unittest.main()

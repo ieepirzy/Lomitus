@@ -550,7 +550,29 @@ def _resolve_from(
             f = _resolve_module(f"{module}.{a.name}", roots, root)
             if f:
                 sub[a.asname or a.name] = f
+    if mod_file and mod_file.endswith("__init__.py") and any(a.name == "*" for a in stmt.names):
+        # "from pkg import *" imports the submodules a literal __all__ names.
+        pkg_dir = Path(mod_file).parent
+        for name in _literal_all(mod_file):
+            f = _module_file(pkg_dir / name, root)
+            if f:
+                sub.setdefault(name, f)
     return mod_file, sub
+
+
+def _literal_all(module_file: str) -> list[str]:
+    """The names in a module's literal __all__ list or tuple, else []."""
+    try:
+        tree = ast.parse(Path(module_file).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+        return []
+    for stmt in tree.body:
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target] if isinstance(stmt, ast.AnnAssign) else []
+        if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets) and isinstance(
+            getattr(stmt, "value", None), (ast.List, ast.Tuple)
+        ):
+            return [e.value for e in stmt.value.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    return []
 
 
 def _string_imports(tree: ast.AST) -> list[str]:
@@ -586,7 +608,29 @@ def resolve_import(
             if resolved and resolved not in results:
                 results.append(resolved)
 
+    for f in list(results):
+        for init in _ancestor_inits(f, root):
+            if init not in results:
+                results.append(init)
     return [r for r in results if r != str(origin)]
+
+
+def _ancestor_inits(module_file: str, project_root: Path) -> list[str]:
+    """Every package __init__.py Python runs before module_file on import:
+    "import a.b.c" runs a/__init__.py and a/b/__init__.py first. Walks up
+    while the directory is a package, inside the project."""
+    p = Path(module_file)
+    d = p.parent.parent if p.name == "__init__.py" else p.parent
+    out: list[str] = []
+    while d.is_relative_to(project_root) and d != project_root.parent:
+        init = d / "__init__.py"
+        if not init.is_file():
+            break
+        out.append(str(init))
+        if d == project_root:
+            break
+        d = d.parent
+    return out
 
 
 _imports_cache: dict[int, tuple[ast.AST, list, list[str]]] = {}
@@ -637,6 +681,7 @@ def file_imports(tree: ast.AST, from_file: str, project_root: str) -> set[str]:
         f = _resolve_module(name, roots, root)
         if f:
             targets.add(f)
+            targets.update(_ancestor_inits(f, root))
     targets.discard(origin)
     return targets
 
