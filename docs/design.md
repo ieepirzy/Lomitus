@@ -180,11 +180,17 @@ A single read of all locks avoids TOCTOU races from concurrent acquisitions. At 
 
 The coordinator builds its own dependency graph via static AST analysis (`dep_graph.py`). No third-party graph tools are required. Nodes are method-level:
 
-- `abs_path::function_name` — module-level `def` and `async def` functions
+- `abs_path::function_name` — module-level `def` and `async def` functions, decorators included
 - `abs_path::ClassName.method_name` — class methods (`def` and `async def`), both sync and async treated identically
-- `abs_path::N` (line number) — module-level non-function statements (imports, variable declarations, bare expressions)
+- `abs_path::ClassName` — the class *header*: decorators, bases, keywords and the non-method members (fields, docstring). Its hash leaves the methods out, so a method edit is never drift of the class or of a sibling method; an edit targets the header only on the header's own lines.
+- `abs_path::import:os,sys`, `abs_path::from:pkg.mod:a,b`, `abs_path::var:LIMIT` — module-level imports and assignments, by what they bind
+- `abs_path::stmt:<digest>` — any other module-level statement (`if`, `try`, bare expressions), by a digest of its AST
 
-`async def` is a first-class node type, not a special case. Classification (`structural | external | benign`) and locking apply identically to sync and async callables. Edges are cross-file import relationships within the project.
+Ids do not move when code moves. A label seen twice in a file gets an ordinal suffix (`C.x#2` for a property setter after its getter, likewise `typing.overload` stubs); before that, such a file failed to index with a primary-key collision.
+
+`async def` is a first-class node type, not a special case. Classification (`structural | external | benign`) and locking apply identically to sync and async callables. Edges are cross-file import relationships within the project, from imports at any nesting depth (inside functions, under `if TYPE_CHECKING:`, in `try`/`except`), from `from pkg import submodule` to the submodule (and to the submodules a literal `__all__` names, for `from pkg import *`), and from string-literal `importlib.import_module("pkg.mod")` / `__import__` calls. Every import also gets an edge to each ancestor package `__init__.py` Python runs first: `import a.b.c` runs `a/__init__.py` and `a/b/__init__.py`, so a change there affects the importer. `ruff analyze graph` records only the leaf module, so on the same project Lomitus's edge set is a superset of ruff's.
+
+Absolute imports resolve against **import roots**, in order: `LOMITUS_IMPORT_ROOTS` (os.pathsep-separated, relative to the project root) or `[tool.lomitus] import_roots` in `pyproject.toml`; otherwise detected from setuptools `package-dir`, hatch wheel `packages`, poetry `packages[].from`, a `src/` directory, then the project root. A src layout with a top-level `tests/` package therefore resolves both.
 
 Graph invalidation is asymmetric, which matters for performance:
 
@@ -411,9 +417,9 @@ The integration combines runtime coordination, AST-based rollback, a live depend
 
 ### External-effect classification (partially implemented)
 
-`contract.py` and `dep_graph.py` seed external nodes from a hardcoded module-prefix set, resolve top-level import aliases, and propagate classification through same-file bare calls, `self`/`cls` calls, and resolved cross-file `from module import symbol` calls. Tests cover each of these cases.
+`contract.py` and `dep_graph.py` seed external nodes from a hardcoded module-prefix set, resolve top-level import aliases, and propagate classification through same-file bare calls, `self`/`cls` calls, resolved cross-file `from module import symbol` calls (at any nesting depth), and qualified calls through a module binding (`import pkg.mod as m; m.fn()`, `from pkg import mod; mod.fn()`, `import pkg.mod; pkg.mod.fn()`, and `Cls.meth` behind any of these). Tests cover each of these cases.
 
-The remaining blind spots include function-local imports, qualified project-module calls such as `module.function()`, dynamic dispatch, decorators and wrappers, and effects outside the prefix set. Cross-file classification is intentionally limited by static resolution and indexing order.
+The remaining blind spots include dynamic dispatch (calls through instances, `getattr`, registries keyed by string), decorators and wrappers that replace a function, external-module imports bound inside a function (`import_aliases` reads module-level imports), and effects outside the prefix set. A function-local project binding is treated as file-wide, an over-approximation. Cross-file classification is one hop per index pass and depends on indexing order (`update_file` re-indexes direct dependents).
 
 **Suggested fix:** implement effect typing — classify nodes as `pure | io | network | db | ...` and propagate the classification transitively through the call graph. A pure function calling an io function is io. The coordinator already has the call graph; effect propagation is a DFS over it.
 

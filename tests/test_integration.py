@@ -8,7 +8,9 @@ selected stderr content.
 """
 from __future__ import annotations
 
+import atexit
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -17,7 +19,13 @@ import unittest
 from pathlib import Path
 
 ROOT    = Path(__file__).parent.parent.resolve()
-DB_PATH = ROOT / ".claude" / "coordinator.db"
+# A private DB per test run (LOMITUS_DB): the coordinator would otherwise
+# anchor to the main checkout's live .claude/coordinator.db, also from a
+# linked worktree, and _reset below deletes the file it points at.
+_DB_DIR = Path(tempfile.mkdtemp(prefix="lomitus-it-"))
+DB_PATH = _DB_DIR / "coordinator.db"
+# Removed when the test process exits (/tmp may be RAM-backed).
+atexit.register(shutil.rmtree, _DB_DIR, ignore_errors=True)
 
 CALC     = str(ROOT / "tests" / "fixtures" / "calc.py")
 MODELS   = str(ROOT / "tests" / "fixtures" / "models.py")
@@ -37,7 +45,7 @@ def _run(payload: dict, *flags: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         cwd=str(ROOT),
-        env={**__import__("os").environ, "PYTHONPATH": str(ROOT / "src")},
+        env={**__import__("os").environ, "PYTHONPATH": str(ROOT / "src"), "LOMITUS_DB": str(DB_PATH)},
     )
 
 
@@ -439,6 +447,30 @@ class TestMethodLevelLocking(unittest.TestCase):
                      "def multiply(self, a: int, b: int) -> int:",
                      "def multiply(self, a: int, b: int) -> int:  # v2")
         self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class TestUpgradeWithHeldLock(unittest.TestCase):
+    """A graph-format migration on open (coordinator._migrate) while an agent
+    holds a lock must not make its release roll the edit back."""
+
+    def setUp(self):
+        _fresh_db()
+        self.path = ROOT / "tests" / "fixtures" / "_upgrade_probe.py"
+        self.path.write_text("def f(x):\n    return x + 1\n", encoding="utf-8")
+        self.addCleanup(lambda: self.path.unlink(missing_ok=True))
+
+    def test_edit_survives_a_migration_between_pretool_and_release(self):
+        f = str(self.path)
+        r = _pretool(f, "a1", "    return x + 1", "    return x + 2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("PRAGMA user_version = 1")  # as if written by the previous release
+        conn.commit()
+        conn.close()
+        self.path.write_text("def f(x):\n    return x + 2\n", encoding="utf-8")
+        r = _release(f, "a1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "def f(x):\n    return x + 2\n")
 
 
 # ---------------------------------------------------------------------------

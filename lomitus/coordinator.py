@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -208,14 +209,20 @@ CREATE INDEX IF NOT EXISTS idx_intents_node    ON agent_intents(node_id);
 # ---------------------------------------------------------------------------
 
 def get_db() -> sqlite3.Connection:
-    # Anchor DB to the main repo root so all per-worktree hook processes share one DB.
-    try:
-        cwd = str(Path.cwd())
-        project_root = find_project_root(cwd)
-        main_root = _main_repo_root(project_root)
-    except Exception:
-        main_root = str(Path.cwd())
-    db_path = Path(main_root) / ".claude" / "coordinator.db"
+    # LOMITUS_DB overrides the location (tests use it so a suite run from a
+    # linked worktree never writes into the main checkout's live DB).
+    override = os.environ.get("LOMITUS_DB")
+    if override:
+        db_path = Path(override)
+    else:
+        # Anchor DB to the main repo root so all per-worktree hook processes share one DB.
+        try:
+            cwd = str(Path.cwd())
+            project_root = find_project_root(cwd)
+            main_root = _main_repo_root(project_root)
+        except Exception:
+            main_root = str(Path.cwd())
+        db_path = Path(main_root) / ".claude" / "coordinator.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
@@ -223,6 +230,36 @@ def get_db() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     _migrate(conn)
     return conn
+
+
+# Bump when node ids or edge semantics change: _migrate then drops the
+# cached graph (nodes, edges, traversals) so it re-indexes cleanly.
+GRAPH_FORMAT = 2
+
+
+def _migrate_graph_format(conn: sqlite3.Connection) -> bool:
+    """Drop the cached graph and record GRAPH_FORMAT, atomically and only
+    when no lock is held. True if it migrated."""
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        held = conn.execute("SELECT COUNT(*) FROM locks").fetchone()[0]
+        if version >= GRAPH_FORMAT or held:
+            conn.execute("ROLLBACK")
+            return False
+        conn.execute("DELETE FROM nodes")
+        conn.execute("DELETE FROM edges")
+        conn.execute("DELETE FROM agent_traversal_nodes")
+        conn.execute("DELETE FROM agent_traversal_edges")
+        conn.execute(f"PRAGMA user_version = {GRAPH_FORMAT}")
+        conn.execute("COMMIT")
+        return True
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -279,6 +316,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "io_error" not in snapshot_cols:
         conn.execute("ALTER TABLE snapshots ADD COLUMN io_error TEXT")
     conn.commit()
+    # Graph format, tracked in PRAGMA user_version. Format 2 (node ids are
+    # labels: "C.x#2", "var:LIMIT", class header nodes; edges from imports at
+    # any depth): drop the cached graph so every file re-indexes on its next
+    # touch instead of mixing old line-number ids with new labels.
+    #
+    # Only while no lock is held: a held lock's release-time drift check
+    # reads the nodes it captured, and a node that vanished reads as drift,
+    # which rolls the agent's edit back. With locks held the drop waits for
+    # a later open. The check, the drop and the version bump are one
+    # IMMEDIATE transaction, so a second hook process that read the old
+    # version can't drop a graph the first one already rebuilt.
+    if conn.execute("PRAGMA user_version").fetchone()[0] < GRAPH_FORMAT:
+        _migrate_graph_format(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +553,12 @@ def _expire_stale_locks(conn: sqlite3.Connection) -> None:
     )
 
 
+def _node_label(node_id: str, file_path: str) -> str:
+    """A node's label: its id without the "<file_path>::" prefix."""
+    prefix = f"{file_path}::"
+    return node_id[len(prefix):] if node_id.startswith(prefix) else node_id.rsplit("::", 1)[-1]
+
+
 def _subgraph_stale(
     file_path: str,
     dep_files: set[str],
@@ -542,7 +598,10 @@ def _subgraph_stale(
             (can_abs,),
         ).fetchall()
         if db_rows:
-            canonical_db[can_abs] = {r[0].split("::")[-1]: r[1] for r in db_rows}
+            # Keyed by node label (node_id minus "<file>::"), the same key the
+            # worktree side uses below: names collide (a property getter and
+            # setter are both "C.x"; labels are "C.x" and "C.x#2").
+            canonical_db[can_abs] = {_node_label(r[0], can_abs): r[1] for r in db_rows}
 
     if not canonical_db:
         return [], []  # nothing indexed in canonical DB yet — not stale
@@ -552,7 +611,7 @@ def _subgraph_stale(
     for wt_file in wt_to_canonical:
         try:
             wt_parsed_cache[wt_file] = {
-                n.name: n.content_hash for n in parse_file(wt_file) if n.name
+                _node_label(n.node_id, n.file_path): n.content_hash for n in parse_file(wt_file)
             }
         except Exception:
             wt_parsed_cache[wt_file] = {}
@@ -566,7 +625,7 @@ def _subgraph_stale(
     wt_tokens = sorted(
         f"{name}:{h}"
         for wt_file, parsed in wt_parsed_cache.items()
-        if wt_file in wt_to_canonical
+        if wt_to_canonical.get(wt_file) in canonical_db
         for name, h in parsed.items()
     )
    
