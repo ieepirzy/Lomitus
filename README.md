@@ -102,27 +102,50 @@ Manual-only flags:
 ## Library API: dependency graph for CI
 
 `lomitus.impact` exposes the same graph without the hook coordinator, for
-test-impact selection and result caching:
+test-impact selection and result caching. Run it from the project root, which
+may be a subdirectory of the repository:
 
 ```python
 from lomitus import impact
 
-graph = impact.index_project(".")                          # in-memory SQLite
-changes = impact.changed_files(".", "origin/main", "HEAD")  # pygit2, renames detected
-affected = impact.reverse_closure(graph, impact.to_absolute([c.path for c in changes], "."))
-nodes = impact.changed_nodes(".", "origin/main", "HEAD")    # which functions changed
-effects = impact.node_effects(graph)                        # (file, qualname) -> external/structural/benign
-key = impact.closure_hash(graph, "tests/test_api.py", ".")  # cache key for a test file's result
+affected = impact.affected_files(".", "origin/main", "HEAD")  # project-relative paths
+graph = impact.index_project(".")                             # in-memory SQLite, head graph
+nodes = impact.changed_nodes(".", "origin/main", "HEAD")      # which functions changed, deletes, renames, reorders
+effects = impact.node_effects(graph)                          # (abs file, qualname) -> external/structural/benign
+key = impact.closure_hash(graph, "tests/test_api.py", ".", extra=[lockfile_digest])  # result-cache key
 ```
 
-- `changed_nodes` and `closure_hash` hash the normalized AST by default
-  (`hash_mode="ast"`), so formatting- and comment-only edits change nothing.
-  The coordinator keeps hashing source text (`"source"`), since an agent reasons
-  over text.
+- `affected_files` takes the changed, added and renamed-to files and their
+  importers on the head graph, and the importers of **deleted files and renamed
+  files' old paths on the base revision's graph** (`importers_at`): a test that
+  still imports a module the change deleted or moved is selected. If you build
+  selection from `reverse_closure` on the head graph yourself, treat deleted and
+  renamed `.py` files as mandatory full-run triggers.
+- `changed_nodes` reports file-level `deleted`, `renamed` and `unparseable`
+  entries (label `<file>`) and a `reordered` entry (label `<order>`) when
+  top-level statements moved: import-time order matters.
+- `changed_nodes`, `file_digest` and `closure_hash` hash the normalized AST by
+  default (`hash_mode="ast"`), so formatting- and comment-only edits change
+  nothing. The coordinator keeps hashing source text (`"source"`), since an agent
+  reasons over text.
+- `closure_hash` covers **code only**: the test file, the `conftest.py` files
+  pytest loads for it, the modules their literal `pytest_plugins` name, and the
+  forward import closure of all of these. It includes the Python version by
+  default, because `ast.dump` output differs between Python versions, so a key is
+  only comparable within one version. Data files, fixtures, the lockfile, plugins
+  enabled outside the project and the environment are not covered: pass their
+  digests in `extra`.
+- Paths: `changed_files`, `changed_nodes`, `affected_files` and `importers_at`
+  speak project-relative POSIX paths; the graph functions speak absolute paths.
+  `to_absolute` raises on a path that doesn't exist under the project root
+  (e.g. one that is repository-relative by mistake).
 - Absolute imports resolve against import roots: `LOMITUS_IMPORT_ROOTS`
   (os.pathsep-separated) or `[tool.lomitus] import_roots` in `pyproject.toml`;
   otherwise detected (`src/`, setuptools/hatch/poetry package dirs, then the
   project root).
+- `index_project` settles cross-file effect typing to a fixpoint, capped by
+  `effect_passes` (default 10); hitting the cap warns and
+  `index_stats(conn)["effects_converged"]` is `"false"`.
 - The API answers graph questions only. Which changes force a full run (conftest,
   migrations, lockfiles, CI config, non-Python inputs), which tests always run,
   and a full run on the main branch as a safety net belong to the consumer.

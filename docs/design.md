@@ -417,8 +417,10 @@ The integration combines runtime coordination, AST-based rollback, a live depend
 
 `lomitus/impact.py` reuses the graph outside the coordinator: `index_project`,
 `changed_files` / `changed_nodes` between two revisions (read from git objects,
-no checkout), `reverse_closure` / `forward_closure` (unbounded), `node_effects`,
-and `closure_hash`.
+no checkout), `affected_files` and `importers_at` (importers of deleted and
+renamed-away files, from the base revision's graph built from its git objects),
+`reverse_closure` / `forward_closure` (unbounded), `node_effects`, and
+`closure_hash`.
 
 **Hash mode per consumer.** `dep_graph._hash` has two modes, chosen explicitly:
 
@@ -427,16 +429,28 @@ and `closure_hash`.
 | Coordinator (drift, worktree merge checks, `is_fresh`) | `source` | Agents reason over source text: a changed comment or reformat inside a locked node is still a change to what the holder read. Unchanged from before. |
 | `impact.changed_nodes`, `impact.file_digest`, `impact.closure_hash` | `ast` | A test result cannot depend on formatting or comments. `ast.dump(..., include_attributes=False)` drops positions, so moving or reformatting code is not a change. Docstrings are part of the AST and still count. |
 
-**Closure hash.** A Merkle root over the file and its whole forward import
-closure: leaves are `(project-relative path, file digest)`, sorted, so the key
-is the same on any checkout. Equal keys mean no Python code the file can
-import changed. Non-Python inputs (fixtures, SQL, templates), the interpreter
-and dependency versions are not covered; pass their digests via `extra`.
+**Closure hash.** A Merkle root over the test file, the `conftest.py` files
+pytest loads for it (its directory up to the project root), the modules their
+literal `pytest_plugins` name, and the forward import closure of all of these.
+Leaves are `(project-relative path, file digest)`, sorted, so the key is the same
+on any checkout; a file digest follows source order, so moving a top-level
+statement changes it. The Python version is a leaf by default, because
+`ast.dump` output differs between Python versions. Code only: non-Python inputs
+(fixtures, SQL, templates), dependency versions and plugins enabled outside the
+project are not covered; pass their digests via `extra`.
+
+**Deleted and renamed files.** The head graph has no node for a deleted file or
+a renamed file's old path, so it can't name their importers. `importers_at`
+writes the base revision's Python files (from git objects) to a temporary
+directory, indexes it graph-only and walks the reverse closure there;
+`affected_files` combines that with the head graph.
 
 **Effect typing in a batch.** Cross-file effects advance one hop per index pass.
-`index_project` re-indexes until no node's kind changes (at most
-`effect_passes`, default 3), so a chain `a -> b -> net` settles regardless of
-file order.
+After a full first pass, `index_project` re-indexes only the importers (by edge;
+resolved qualified-call targets are edges) of files with an external node, then
+of files whose kinds changed, until a pass changes nothing. That fixpoint equals
+re-indexing every file until no kind changes (tested). `effect_passes` (default
+10) caps it; hitting the cap warns and is recorded in `index_stats`.
 
 ## Current limitations and roadmap
 
@@ -459,10 +473,10 @@ cannot see (dynamic dispatch, string-keyed registries, tests reaching code over
 HTTP or a subprocess) are why a consumer needs full-run triggers and a full run
 on main.
 
-`from pkg import submodule` keeps an edge to `pkg/__init__.py` as well as the
-submodule: Python runs the package `__init__` on that import. `ruff analyze
-graph` records only the submodule, so Lomitus's edge set is a superset of ruff's
-on the same project.
+Every import keeps an edge to each ancestor package `__init__.py` as well as the
+module itself: Python runs those `__init__` files on that import. `ruff analyze
+graph` records only the module, so Lomitus's edge set is a superset of ruff's on
+the same project.
 
 ### Snapshot execution isolation (implemented with limitations)
 
